@@ -1,0 +1,27 @@
+# PyAppify 启动器配置（参考 ok-ww / ok-nte）.
+#
+# 启动器 exe（从 https://github.com/ok-oldking/pyappify 的 Releases 下载
+# pyappify.exe，改名 ok-majsoul.exe）运行时读本文件：
+#   首次运行 = 克隆 git_url 的 update 仓库 -> 下载独立 Python 3.12 ->
+#   pip 安装 requirements.txt -> 运行 main.py；
+#   之后每次启动检查 update 仓库的新 tag，自动增量更新代码。
+#
+# 本仓库是开发/测试仓库；tag 推送后由 .github/workflows/release.yml 把
+# 白名单文件同步到 update 仓库（tools/sync_update_repo.py）。
+# 注意：update 仓库是私有的，启动器首次克隆会弹 GitHub 登录窗口
+# （Windows 凭据管理器），登录一次即可。
+
+name: "ok-majsoul"
+uac: true
+icon: "icons/icon.png"
+website: "https://github.com/hiberjing-afk/ok-majsoul"
+
+profiles:
+  - name: "release"
+    git_url: "https://github.com/hiberjing-afk/ok-majsoul-update.git"
+    admin: true
+    main_script: "main.py"
+    requires_python: "3.12"
+    requirements: "requirements.txt"
+    use_pythonw: true
+    show_add_defender: true

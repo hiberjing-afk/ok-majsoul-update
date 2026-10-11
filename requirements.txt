@@ -1,0 +1,15 @@
+ok-script[ocr,qt]>=2.0.8
+opencv-python>=4.10.0
+numpy>=1.26.0
+Pillow>=10.0.0
+pywin32==311
+psutil>=5.9.0
+# 牌效 / 向听 / 听牌计算引擎. 零外部依赖, MIT, Python >= 3.10.
+# 实测 0.14.0: 三人麻将传 player_count=3 会自动去掉 2m-8m(只剩 27 种牌).
+jansou>=0.14.0
+# 对局内感知(YOLO, ONNX). v1.1 起推理走 onnxruntime-directml(DirectML 走
+# DirectX 12, N/A/I 卡都能加速), **不再依赖 torch/ultralytics** -- 依赖体积
+# 从 ~3GB 降到 ~300MB. 与 torch 后端的一致性验收见 tools/parity_check.py
+# (逐框一致) 与 tools/parity_synth.py (合成手牌 59/60 手读数完全一致、
+# conf 门槛零翻转). 权重(models/*.onnx)不进版本库, 随 Release 包分发.
+onnxruntime-directml>=1.20.0
