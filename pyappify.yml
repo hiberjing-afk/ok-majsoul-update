@@ -8,8 +8,8 @@
 #
 # 本仓库是开发/测试仓库；tag 推送后由 .github/workflows/release.yml 把
 # 白名单文件同步到 update 仓库（tools/sync_update_repo.py）。
-# 注意：update 仓库是私有的，启动器首次克隆会弹 GitHub 登录窗口
-# （Windows 凭据管理器），登录一次即可。
+# 注意：update 仓库是公开的——PyAppify 的 git2 层 HTTPS 只支持匿名克隆，
+# 私有仓库在 CI 与用户端都会克隆失败；公开后启动器首次克隆无需登录。
 
 name: "ok-majsoul"
 uac: true

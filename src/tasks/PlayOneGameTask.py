@@ -1104,6 +1104,15 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                 RESULT_SCREEN, RESULT_CONFIRM, cfg,
                 timeout=tuning.RESULT_CONFIRM_TIMEOUT)
             if confirm is None:
+                # 先试奖励页: 「获得奖励」弹窗也带「终局」标题(实测 NCC
+                # 1.000、位置一分不差), 会被上面的判据认成"又一页结算页",
+                # 但它没有「确认」按钮, 等满超时也点不掉. 2026-10-12 02:39
+                # 实跑: 三个调用点都把 _handle_reward_page 排在本函数后面,
+                # 永远轮不到 —— 结果在 _back_to_lobby 里空转 60s 后
+                # RuntimeError 把整轮连打掀翻. 在这里转交(它内部重抓帧
+                # 复查, 点干净为止), 三个调用点就都覆盖到了.
+                if self._handle_reward_page(frame, cfg, game):
+                    return True
                 # 页面认出来了但按钮还没出现: 可能是点数结算还在算, 或者这一局
                 # 是中途认输/逃跑, 结算页长得不一样. 截图留证后按"结束"处理,
                 # 交给外层的卡死检测收尾.
