@@ -130,7 +130,7 @@ class Bench:
         atexit.register(self.finish)
         print(f"[BENCH] 已开启基准采集, 每 {self.duration:.0f}s 自动落盘"
               if self.duration > 0 else
-              f"[BENCH] 已开启基准采集, 程序退出时落盘")
+              "[BENCH] 已开启基准采集, 程序退出时落盘")
         print(f"[BENCH] 输出目录: {self._out_dir}")
 
     def finish(self) -> None:
@@ -328,7 +328,8 @@ class Bench:
                 "hand_reads": round(len(hand) / elapsed, 3) if elapsed else None,
                 "model_inferences": round(len(inf) / elapsed, 3) if elapsed else None,
                 "hand_reads_active_phase": round(len(active) / elapsed, 3) if elapsed else None,
-                "hand_reads_non_active_phase": round(len(non_active) / elapsed, 3) if elapsed else None,
+                "hand_reads_non_active_phase":
+                    round(len(non_active) / elapsed, 3) if elapsed else None,
             },
             "counts": {
                 "screenshots": len(grabs),

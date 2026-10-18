@@ -39,12 +39,12 @@ from __future__ import annotations
 卡住), 所以拉前台做在交互层 src/interactions.py 的 should_capture 里 --
 不需要手动把游戏点上前台.
 
-配置: configs/PlayOneGameTask.json。界面上只有四个用户旋钮:
+配置: configs/PlayOneGameTask.json。界面上只有三个用户旋钮:
     players / length         房型(两个下拉框, 组合出房间规格)
     max_games                连打几局(0 = 只建房不开始)
-    save_frames              每轮是否存帧到 data/debug/
-    robust_discard           手牌有认不准的牌时是否走稳健出牌
 其余阈值与延迟全部是 `src/tasks/tuning.py` 里的代码常量.
+每轮存帧(`save_frames`)与稳健出牌开关(`robust_discard`)已移除: 正常帧
+没有诊断价值(协议信任档落地), 稳健出牌恒开(它只在低置信出现时参战).
 """
 
 import json
@@ -55,27 +55,40 @@ from datetime import datetime
 from pathlib import Path
 
 from src.annotations import missing_categories
-from src.detection import (MIN_TILE_CONF, low_confidence, missing_slots,
-                           split_bright_dim, split_setaside, tile_brightness,
-                           vote_labels)
-from src.detector import GameVision, with_voted_labels
+from src.detection import (
+    low_confidence,
+    missing_slots,
+    split_bright_dim,
+    split_setaside,
+    tile_brightness,
+)
+from src.detector import GameVision
 from src.imageio import imwrite_unicode
 from src.instrumentation import bench
 from src.mahjong import timing
-from src.mahjong.table import (ACTION_BABEI, ACTION_DISCARD, ACTION_MELD,
-                               ACTION_RIICHI, ACTION_WAIT, ACTION_WIN,
-                               BUTTON_GANG, TABLE_GAVE_UP, TABLE_IGNORING,
-                               TABLE_WAITING,
-                               DealWatch, TableWatch, action_confirmed,
-                               decide_turn, expected_concealed_counts,
-                               has_yaku_pair, meld_count_of,
-                               meld_taken_kinds, pick_tile_index)
+from src.mahjong.table import (
+    ACTION_BABEI,
+    ACTION_DISCARD,
+    ACTION_MELD,
+    ACTION_RIICHI,
+    BUTTON_GANG,
+    TABLE_GAVE_UP,
+    DealWatch,
+    TableWatch,
+    action_confirmed,
+    decide_turn,
+    expected_concealed_counts,
+    meld_count_of,
+    pick_tile_index,
+)
+from src.net.assist import NetAssist
 from src.paths import DEBUG_ARTIFACTS_DIR
+from src.retention import prune_turn_frames
 from src.rooms import RoomSpec, ready_marker, required_categories, spec_by_key, start_step
 from src.tasks import tuning
-from src.tasks.CreateFriendsRoomTask import (CreateFriendsRoomTask,
-                                             TaskStopped,
-                                             _DEFAULT_CONFIG as _BASE_CONFIG)
+from src.tasks.CreateFriendsRoomTask import _DEFAULT_CONFIG as _BASE_CONFIG
+from src.tasks.CreateFriendsRoomTask import CreateFriendsRoomTask, TaskStopped
+from src.tasks.hand_loop import HandLoop, RoundState
 from src.vision import StuckDetector, is_toggle_green
 
 # 结算页(对局结束的点数结算). 页面名与区域名对应
@@ -154,6 +167,42 @@ MODE_RANKED = "段位场"
 MODE_FRIENDS = "友人场"
 MODE_OPTIONS = (MODE_RANKED, MODE_FRIENDS)
 
+# 网络读牌不可用时, 把"到底为什么"说清楚.
+# 2026-10-16 实机教训: 只打 `status` 的话, "没开抓包"这局打出来的是
+# `no-round`(因为目录里剩着上一局的旧 spool, 桥重放出一份已结束的牌局),
+# 读日志的人会以为"还没发牌", 完全查不到真正的原因.
+_NET_UNAVAILABLE_HINT = {
+    "no-spool": "没找到本局的 spool —— 抓包没开?(TUN + mitmdump, 见 docs/NET_CAPTURE.md)",
+    "no-round": "spool 里没有进行中的一手 —— 多半是上一局留下的旧文件",
+    "no-seat": "协议里还没有我的座位(未发牌/未进对局)",
+    "protocol-suspect": "协议出现未建模动作, 已回退视觉",
+    "bridge-error": "桥内部异常, 已回退视觉",
+    "no-state": "桥拿不到牌局状态, 已回退视觉",
+}
+
+# `no-round` 的第二种含义: 这一场正在打, 只是刚好在两手之间(和了演出 /
+# 发牌动画). 2026-10-16 实测: 每手之间有十几秒就是这个状态, 日志一路在说
+# "多半是上一局留下的旧文件", 把人往错方向带. 判据见 _net_unavailable_hint.
+_NET_ROUND_GAP_HINT = "这一场在打, 只是当前没有进行中的一手（两手之间的过场）"
+
+
+# 协议胶水层搬到了 src/tasks/glue.py(协议读数 -> 决策输入的翻译, 可独立测).
+# 这里显式再导出: 单测与工具一直按 `PlayOneGameTask._proto_turn_of` 这种
+# 模块属性访问, 搬走后保留同一组名字, 不必去改所有调用点.
+from src.tasks.glue import (  # noqa: F401
+    _draw_settle_pending,
+    _ev_record_of,
+    _plan_ev,
+    _prefer_non_aka_box_impl,
+    _proto_clock_read,
+    _proto_clock_turn_of,
+    _proto_meld_window_of,
+    _proto_round_open_of,
+    _proto_turn_of,
+    _trust_skips_confirm,
+    _urgent_now,
+)
+
 # 在开房任务的默认配置之上, 加对局内需要的参数
 _DEFAULT_CONFIG = {
     **_BASE_CONFIG,
@@ -171,11 +220,6 @@ _DEFAULT_CONFIG = {
     # 内部调参全搬去了 src/tasks/tuning.py -- 框架会把 default_config 里
     # 每一项都渲染成控件, 塞满阈值/延迟只会让卡片没法看.
     "max_games": 1,                 # 连打几局
-    # 每轮存帧到 data/debug/. 为什么值得常开见 tuning.SAVE_FRAMES 的注释.
-    "save_frames": tuning.SAVE_FRAMES,
-    # 手牌里有认不准的牌时别拿"这手牌算出来的最优"直接打. 背景与实跑案例
-    # 见 tuning.ROBUST_DISCARD 的注释.
-    "robust_discard": tuning.ROBUST_DISCARD,
 }
 
 
@@ -192,6 +236,10 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         # "建房选四人, 打牌按三人" 的错位. 见 _DEFAULT_CONFIG 的说明.
         self._vision: GameVision | None = None
         self._record_path: Path | None = None
+        self._net: NetAssist | None = None        # 网络读牌对账门面
+        self._net_log_at: float = 0.0             # 对账日志限流时间戳
+        self._capture = None              # 抓包链路(mitmdump + TUN)生命周期
+        self._capture_spool: Path | None = None   # 本场 spool 路径(显式交给桥)
         self._need_confirm_click = False   # 出牌是否需要"选中再确认"
         self._rng = random.Random()
         self._cfg: dict = {}
@@ -261,8 +309,33 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         if missing:
             raise RuntimeError(f"房间 '{spec.label}' 缺标注: {missing}")
 
+        # 先修剪上一批留下的每轮诊断帧, 再开始记这一批(见 _prune_debug_frames)。
+        self._prune_debug_frames()
         self._open_record()
-        vision = self._ensure_vision()
+        self._ensure_vision()          # 副作用: 模型没加载就先加载
+
+        # 抓包链路(mitmdump + mihomo TUN)已在 `_before_room_flow` 起好 ——
+        # 段位场点完"四人东"就自动匹配, 分钟级的匹配期也要读协议(2026-10-17
+        # 用户拍板"提前到任务开始"). 本方法只管打; 停止由 `_after_room_flow`
+        # 的 finally 兜底(停止指令/异常退出都会关掉自己起的进程).
+        self._run_games(cfg, spec)
+
+    def _before_room_flow(self, cfg: dict) -> None:
+        """任务一开始(点四人东之前)就起抓包. 覆写基类钩子."""
+        self._cfg = cfg
+        self._start_capture()
+
+    def _after_room_flow(self) -> None:
+        """房间流程收尾(覆写基类钩子): 关掉自己起的抓包进程."""
+        self._stop_capture()
+
+    def _run_games(self, cfg: dict, spec) -> None:
+        """连打循环(段位场 / 友人场两路). 抓包在上层已经起好."""
+        # 网络读牌门面: 本场只建一次, 贯穿整场(段位场连打多局共用同一个
+        # spool 文件与同一个 GameState). 关闭档不构造(免得白扫目录).
+        # 桥不可用时一切对账静默回退视觉, 绝不拖垮主循环.
+        self._net = self._build_net(cfg)
+        self._net_log_at = 0.0
 
         if spec.ranked:
             self._ranked_games(cfg, spec)
@@ -277,6 +350,10 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             # 上一局的结算页可能没点干净(终局页出现有延迟), 先清掉再等
             # "开始" —— 等待期间也会顺手点掉慢弹出来的页面, 见 _press_start.
             self._press_start(spec, cfg, game)
+            # 点完「开始」这一刻服务端还没发 authGame —— 上一场的
+            # game_over/match_started 必须先清掉, 否则新一局一进去就误判
+            # "协议说本局结束"(见 _reset_net_session).
+            self._reset_net_session()
             self._wait_leave_ready_page(spec, cfg)
 
             finished = self._play_one_game(cfg, game)
@@ -289,6 +366,11 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                     self.log_info("收到停止指令, 结束连打")
                     return
                 self.log_error(f"第 {game} 局没能正常结束，停止连打")
+                break
+            if self._capture_broken:
+                self.log_warning(
+                    f"[抓包] 链路已废，第 {game} 局打完即收工"
+                    f"（不再打剩余 {cfg['max_games'] - game} 局）")
                 break
 
             if game < cfg["max_games"]:
@@ -328,6 +410,11 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                     return
                 self.log_error(f"第 {game} 局没能正常结束，停止连打")
                 break
+            if self._capture_broken:
+                self.log_warning(
+                    f"[抓包] 链路已废，第 {game} 局打完即收工"
+                    f"（不再打剩余 {cfg['max_games'] - game} 局）")
+                break
 
             if game < cfg["max_games"]:
                 lo, hi = tuning.BETWEEN_GAMES_DELAY_RANGE
@@ -352,9 +439,18 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         deadline = time.time() + tuning.MATCHMAKING_TIMEOUT
         next_status = time.time() + 30.0
         frame = None
+        # 连打时"上一场的 match_started"还留在状态里 —— 不清掉的话下面
+        # 协议优先会立刻假阳返回(误以为新一场已经开始). 只清标志, 不动桥.
+        self._reset_net_session()
         while time.time() < deadline:
             if self._should_yield():
                 raise TaskStopped("等待匹配期间收到停止指令")
+            # 协议优先: 抓包在跑时 authGame(is_game_start) 一到就算匹配成功,
+            # 不用等视觉横幅 —— 横幅在加载快的机器上一闪而过, 模板也可能
+            # 因为版本更新而认不出来(那时视觉这条路等于永远 False).
+            if self._protocol_says_matching():
+                self.log_info("    匹配成功（协议: authGame is_game_start）")
+                return
             frame = self._grab()
             for screen, keyword in candidates:
                 if self._locate(screen, keyword, cfg, frame,
@@ -364,7 +460,8 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                     return
             now = time.time()
             if now >= next_status:
-                self.log_info(f"    还在匹配（已等 {now - (deadline - tuning.MATCHMAKING_TIMEOUT):.0f}s，"
+                waited = now - (deadline - tuning.MATCHMAKING_TIMEOUT)
+                self.log_info(f"    还在匹配（已等 {waited:.0f}s，"
                               f"上限 {tuning.MATCHMAKING_TIMEOUT:.0f}s）")
                 next_status = now + 30.0
             self.sleep(tuning.PAGE_POLL_INTERVAL)
@@ -403,6 +500,38 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         return missing_categories(required_categories(spec),
                                   set(self._annotations))
 
+    def _prune_debug_frames(self) -> None:
+        """修剪上一批留下的每轮诊断帧(见 src/retention.py).
+
+        为什么放在任务启动时: 早年 `save_frames` 每轮一张 1080p PNG, 连打几天
+        就是上百 GB(2026-10-17 实测 74323 张 / 169.5GB), 而"定期手动跑清理脚本"
+        这件事在实践里等于没做。跟抓包一样, 该自动的都自动掉。
+
+        只删 `frame_g<局>_t<轮>_*.png`; 低置信/闸门/待标注留证帧与 jsonl
+        对局记录一律不碰。**永不抛**: 清理是锦上添花, 失败只记 warning,
+        绝不能因为删文件失败就不让开局。
+        """
+        if not tuning.DEBUG_PRUNE_AUTO:
+            return
+        try:
+            res = prune_turn_frames(
+                DEBUG_ARTIFACTS_DIR,
+                keep_days=tuning.DEBUG_FRAME_KEEP_DAYS,
+                max_files=tuning.DEBUG_FRAME_MAX_FILES,
+                max_bytes=tuning.DEBUG_FRAME_MAX_BYTES,
+                apply=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 清理失败不拖垮开局
+            self.log_warning(
+                f"调试帧修剪失败（{type(exc).__name__}），跳过本次清理")
+            return
+        if res.changed:
+            self.log_info(
+                f"已清理调试帧 {res.removed}/{res.scanned} 张"
+                f"（释放 {res.freed_mb:.0f}MB，保留 {res.kept} 张）")
+        elif res.errors:
+            self.log_warning(f"调试帧修剪有 {res.errors} 项失败，跳过")
+
     # ---------------------------------------------------------------
     # 一局的循环
     # ---------------------------------------------------------------
@@ -421,10 +550,608 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             marker[0], marker[1], cfg, frame, strict=True, verbose=False
         ) is not None
 
+    # ---------------------------------------------------------------
+    # 抓包链路(mitmdump + mihomo TUN)的起停
+    # ---------------------------------------------------------------
+
+    def _start_capture(self) -> None:
+        """按 tuning.CAPTURE_AUTO 起抓包链路. 已在跑的复用, 失败静默降级.
+
+        绝不抛: 抓包只是"让协议能读到"的前提, 读不到照样能纯视觉打完
+        (网络读牌永远是增强不是依赖, 见 AGENTS.md 铁律 3).
+        """
+        self._capture = None
+        self._capture_spool = None
+        if not tuning.CAPTURE_AUTO:
+            return
+        # 关闭档连抓包都不起: 用户明确要脱离网络(一键回退纯视觉).
+        if (self._cfg.get("net_read") or tuning.NET_READ) == tuning.NET_READ_OFF:
+            return
+        try:
+            from src.net.capture import CaptureSupervisor
+
+            supervisor = CaptureSupervisor(
+                port=tuning.CAPTURE_MITM_PORT,
+                mitm_bin=tuning.CAPTURE_MITMDUMP,
+                mihomo_bin=tuning.CAPTURE_MIHOMO,
+                start_timeout=tuning.CAPTURE_START_TIMEOUT,
+                tun_device=tuning.CAPTURE_TUN_DEVICE,
+                upstream=tuning.CAPTURE_UPSTREAM,
+                install_ca=tuning.CAPTURE_INSTALL_CA,
+            )
+            status = supervisor.start()
+        except Exception as exc:  # noqa: BLE001 - 抓包永不拖垮任务
+            self.log_error(f"抓包启动异常（{type(exc).__name__}: {exc}），"
+                           f"改用纯视觉（见 docs/NET_CAPTURE.md）")
+            return
+        self._capture = supervisor
+        if status.spool is not None:
+            self._capture_spool = status.spool
+        self.log_info(f"[抓包] {status.summary()}")
+        for note in status.notes:
+            self.log_info(f"[抓包]   {note}")
+        for err in status.errors:
+            self.log_warning(f"[抓包]   {err}")
+        if not status.ok:
+            self.log_warning(
+                "[抓包] 抓包链路没就位 —— 网络读牌会自动回退视觉；"
+                "排查见 docs/NET_CAPTURE.md §六")
+
+    def _stop_capture(self) -> None:
+        """关掉**我们自己起的**抓包进程. 复用来的一个都不碰. 绝不抛."""
+        supervisor = self._capture
+        if supervisor is None:
+            return
+        self._capture = None
+        try:
+            for line in supervisor.stop():
+                self.log_info(f"[抓包] {line}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------------------------------------------------------------
+    # 协议判牌局起止(协议优先, 视觉兜底)
+    # ---------------------------------------------------------------
+
+    def _protocol_says_matching(self) -> bool:
+        """协议说"匹配成功、已进对局"(ResAuthGame.is_game_start).
+
+        关掉 ROUND_BY_PROTOCOL / 没建门面 / 桥不可用一律返回 False, 调用方
+        接着走视觉判定 —— 这就是"兜底"那两个字的落点.
+        """
+        if not tuning.ROUND_BY_PROTOCOL or self._net is None:
+            return False
+        try:
+            return self._net.match_started()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _protocol_says_game_over(self) -> tuple[bool, str]:
+        """协议说"这一场打完了"(NotifyGameEndResult / NotifyGameTerminate).
+
+        返回 (是否结束, 原因). 原因非空 = 被中断(reason 原样带回日志).
+        """
+        if not tuning.ROUND_BY_PROTOCOL or self._net is None:
+            return False, ""
+        try:
+            session = self._net.session()
+        except Exception:  # noqa: BLE001
+            return False, ""
+        if not session["game_over"]:
+            return False, ""
+        return True, session["reason"]
+
+    def _reset_net_session(self) -> None:
+        """开新一局之前, 把"上一场"的起止标志清掉(友人场路径).
+
+        **为什么必须有**(2026-10-16 实机踩到): 同一个 GameState 贯穿整轮连打,
+        `match_started` / `game_over` 是"这一场"的粘性标志。段位场在
+        `_wait_matchmaking` 里清过, 友人场走的是 `_press_start` +
+        `_wait_leave_ready_page`(根本不经过 `_wait_matchmaking`) —— 于是
+        点完「开始」到服务端 authGame 到达之间那一两秒, 上一场的
+        `game_over=True` 还挂在状态里, `_play_one_game` 一进去就报
+        "协议报告本局结束", 并顺手把 `_game_over_since` 也点着了
+        (后果见主循环 1.6 分支)。实测那一次侥幸没出事 —— 上一场的结算页
+        刚好已经被点掉, `_handle_result_page` 返回了 False; 但只要结算页还在
+        屏幕上, 新一局会在第 0 轮被判"打完"直接跳过, 白烧一局。
+        """
+        if self._net is None or not tuning.ROUND_BY_PROTOCOL:
+            return
+        st = getattr(self._net, "state", None)
+        # 已经在"这一手进行中"就别清: `round_open` 是事件流推导出来的,
+        # 清掉以后要等下一手 ActionNewRound 才会重新点亮 —— 而那一手的事件
+        # 早就被消费掉了, 会让整手都读不到协议(比误报严重得多)。
+        if st is not None and getattr(st, "round_open", False):
+            return
+        try:
+            self._net.reset_session()
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            pass
+
+    def _build_net(self, cfg: dict) -> NetAssist | None:
+        """按档位构造网络读牌门面(关闭档返回 None, 整条路径不参战).
+
+        档位住在 tuning.NET_READ(与 MELD_POLICY / BABEI_POLICY 同类的一次性
+        策略开关, 不是每局都要改的用户控件, 所以不进界面); cfg 里显式写了
+        "net_read" 时以它为准, 留一个不改源码就能覆盖的口子.
+
+        spool 优先用抓包模块给的那个路径: 自动抓包起的 mitmdump 写进
+        `_capture_spool`, 显式指过去比"去目录里猜哪份最新"准得多(见
+        tuning.NET_MAX_SPOOL_AGE 里那个"把上一局旧文件当本局"的踩坑).
+        抓包没自动起(CAPTURE_AUTO 关掉 / 手动抓包)时退回按 mtime 发现.
+        """
+        mode = cfg.get("net_read") or tuning.NET_READ
+        if mode == tuning.NET_READ_OFF:
+            return None
+        # getattr 兜底: 单测把未绑定方法绑到 stub self 上, stub 不带这个字段.
+        return NetAssist(path=getattr(self, "_capture_spool", None),
+                         debug_dir=DEBUG_ARTIFACTS_DIR,
+                         max_spool_age=tuning.NET_MAX_SPOOL_AGE)
+
+    def _net_unavailable_hint(self, status: str) -> str:
+        """"不可用"状态配一句能照着查的中文提示.
+
+        `no-round` 有歧义, 必须分开说(2026-10-16 实机踩到): 这一场正在打、
+        只是刚好在两手之间(和了演出 / 发牌动画)时状态也是 no-round ——
+        那十几秒里日志一直在说"多半是上一局留下的旧文件", 把人往错方向带.
+        判据用 session(): 这一场已经开始过(match_started)、又还没结束 →
+        就是局间空档. 其余情况沿用 _NET_UNAVAILABLE_HINT.
+        """
+        if status == "no-round" and self._net is not None:
+            try:
+                session = self._net.session()
+            except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+                # 桥都坏了就别猜原因(猜错比不说更坏): 退成"只有状态码".
+                return ""
+            if (session and session.get("match_started")
+                    and not session.get("game_over")):
+                return _NET_ROUND_GAP_HINT
+        return _NET_UNAVAILABLE_HINT.get(status, "")
+
+    def _net_suspect_detail(self, status: str) -> str:
+        """把"哪条报文让桥判了可疑"带进日志(见 NetAssist.status_detail).
+
+        只在 protocol-suspect 时问: 其余状态的"明细"是无关信息, 加进去只会
+        让那行日志变长、把真正该看的状态码挤掉. 绝不抛.
+        """
+        if status != "protocol-suspect" or self._net is None:
+            return ""
+        try:
+            return self._net.status_detail()
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return ""
+
+    def _net_step(self, hand, buttons):
+        """一轮网络读牌对账.
+
+        返回 (hand, buttons, exempt, note, trust):
+        - 影子对账档: hand/buttons 原样返回, note 只进日志与出牌记录;
+        - 接管读数档: hand 换协议纠错后的标签(坐标不动)、buttons 裁掉协议
+          没认的(视觉多认的按钮 = 误鸣风险); exempt 是被协议纠正过的槽位,
+          调用方要把它们从 blurry 里剔除(我们已经确知它们的真值了).
+        - trust: "trusted"=协议手牌与视觉对上(计数一致无歧义), 本轮标签就是
+          协议真值, 消费方可跳过低置信/双帧重算(见 tuning.NET_TRUST_PROTO);
+          "mismatch"=协议有手牌但对不上(读不出/读不动), 调用方该存现场帧;
+          "ambiguous"=**多重集已由协议修正, 但槽位归属定不下来**(2 槽以上待补).
+          消费方可以拿这手牌算牌效, 但**不能照它的下标点牌** —— 标错的槽上
+          点下去是另一张牌;
+          "conflict"=**张数就和协议对不上**(两边都有值). 这一手牌连张数都是错的,
+          一张都不能用来算牌效/点牌 —— 以协议为准, 本轮不动等下一帧
+          (见 glue._hand_conflict_veto, 没有超时退视觉);
+          "off"=关闭/不可用/异常, 协议没说话.
+        - 关闭 / 不可用 / 抛异常: 一律原样返回, 走纯视觉.
+        """
+        mode = self._cfg.get("net_read") or tuning.NET_READ
+        if self._net is None or mode == tuning.NET_READ_OFF:
+            return hand, buttons, frozenset(), "", "off"
+        assist = (mode == tuning.NET_READ_ASSIST)
+        try:
+            step = self._net.step(hand, buttons, assist=assist)
+        except Exception as exc:  # noqa: BLE001 - 网络层永不拖垮主循环
+            self._log_repeat_once(
+                "net_err", type(exc).__name__,
+                f"  网络读牌对账异常（{type(exc).__name__}），本轮回退视觉",
+                level="warning")
+            return hand, buttons, frozenset(), "", "off"
+        if not step.available:
+            hint = self._net_unavailable_hint(step.status)
+            detail = self._net_suspect_detail(step.status)
+            why = f"（{step.status}）" if not hint else f"（{step.status}: {hint}）"
+            if detail:
+                why += f" 明细={detail}"
+            self._log_repeat_once("net_na", f"{step.status}|{detail}",
+                                  f"  网络读牌不可用{why}，走视觉")
+            return hand, buttons, frozenset(), "", "off"
+        now = time.time()
+        if now - self._net_log_at >= tuning.NET_LOG_INTERVAL:
+            self._net_log_at = now
+            self.log_info(f"  [网络读牌/{mode}] {step.note}")
+        if not assist:
+            return hand, buttons, frozenset(), step.note, "off"
+        if step.hand is not None:
+            hand = step.hand
+        if step.buttons is not None:
+            buttons = step.buttons
+        if getattr(step, "conflict", False):
+            trust = "conflict"
+        elif getattr(step, "ambiguous", False):
+            trust = "ambiguous"
+        else:
+            trust = "trusted" if getattr(step, "trusted", False) else "mismatch"
+        return hand, buttons, step.blurry_exempt, step.note, trust
+
+    def _net_clock(self) -> dict:
+        """协议给的"时机": 轮到我了吗 / 还剩几秒(拿不到就是保守值). 绝不抛.
+
+        与 _net_step 分开的理由: 那个是**对账读数**(要求 available(): 这一手在
+        打 + 喂料新鲜 + 协议不可疑), 这个是"当前这一动还剩多少时间" —— 恰恰要
+        在决策那一刻取. 见 tuning.NET_TURN_CLOCK.
+        """
+        if self._net is None or not tuning.NET_TURN_CLOCK:
+            return {"my_turn": False, "left": None}
+        mode = self._cfg.get("net_read") or tuning.NET_READ
+        if mode == tuning.NET_READ_OFF:
+            return {"my_turn": False, "left": None}
+        try:
+            return self._net.turn_clock()
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return {"my_turn": False, "left": None}
+
+    @staticmethod
+    def _is_urgent(clock: dict) -> bool:
+        """协议倒计时快到了没有(见 tuning.NET_URGENT_SECONDS).
+
+        **只认"还没超时的正数"**: left 为负说明桥滞后或计时口径不对, 拿它压缩
+        节拍等于跟一个不存在的倒计时赛跑, 而且会一直压(机器人变得机械).
+        """
+        if not tuning.NET_TURN_CLOCK:
+            return False
+        left = clock.get("left")
+        if left is None:
+            return False
+        try:
+            return 0.0 <= float(left) <= tuning.NET_URGENT_SECONDS
+        except (TypeError, ValueError):
+            return False
+
+    def _proto_turn(self) -> bool | None:
+        """协议对"现在该不该我动"的权威说法. None = 不接管/不可信 -> 不否决.
+
+        三个前提缺一不可, 都是"宁可不用":
+        ① 必须已经切到**接管档** —— 这道闸是"整轮否决", 否决掉一个出牌就会
+           把整手牌拖到被托管(见下一段), 所以只在接管档参战;
+        ② `NET_TURN_VETO` 必须**单独 arm**. 与 NET_READ 拆开见 tuning.py:
+           同一档位里"读数接管"不改变动作种类(纠标签 / 裁误检按钮, 两个方向
+           都是减害), 而"整轮否决"误一次就报废一手牌 —— 且它在影子档是零样本
+           (从没真正执行过). 不让一条零验证的机制搭 NET_READ 的便车;
+        ③ 桥必须真的可用(`available()`: 这一手在打 + 喂料新鲜 + 协议不可疑).
+           桥滞后时那份操作列表可能早已过期, 拿"过期窗口里没有打牌选项"去否决
+           出牌, 会把整手牌拖到被托管 —— 那比误打一张牌严重得多.
+        """
+        mode = self._cfg.get("net_read") or tuning.NET_READ
+        if mode != tuning.NET_READ_ASSIST or not tuning.NET_TURN_VETO:
+            return None
+        return _proto_clock_read(self._net, mode)
+
+    def _proto_clock_turn(self) -> bool | None:
+        """协议对"这一刻有没有我的出牌操作"的说法. None = 不可用/不可信.
+
+        **不看档位** —— 与 `_proto_turn` 的区别就在这里. 它只喂给
+        `decide_turn` 的 `proto_turn`(单独立直按钮的过滤器), 否决不了任何别的
+        动作, 也就不可能把整手牌拖进托管, 所以影子档也该参战:
+        2026-10-17 东三局, 那一刻协议给的可用操作是 **碰**(type 3)、手里 13 张,
+        而视觉在同一帧里读出一个 lizhi(conf 0.714, 从"上家立直"的宣告画面里
+        误读出来) —— 整轮否决当时是 None(影子档不参战), 于是没人拦它, 一个
+        单帧误检报废了一整手牌.
+        """
+        return _proto_clock_read(
+            self._net, self._cfg.get("net_read") or tuning.NET_READ)
+
+    def _proto_meld_window(self) -> bool | None:
+        """协议说"此刻开着**给我的**鸣牌窗口"(吃/碰/大明杠).
+
+        它是 `_proto_turn` 那道整轮否决的**唯一缺口**: 鸣牌窗口里协议只给
+        鸣牌操作、不给打牌操作, 于是 `protocol_says_my_turn()` 必然为假 ——
+        那不是"不轮到你", 那是"这一口轮到你要不要鸣". 夹具
+        `liqi_sanma_2rounds` 的两次 `ActionDiscardTile` 给的 operation_list
+        都是 `[3]`, 实测坐实.
+
+        与 `_proto_turn` **同一条前提**(同一个开关、同一份新鲜度): 否决没 arm
+        时 my_turn 恒 None, 这个缺口也就没有存在的必要, 直接 None 不参战.
+        取 `meld_options()` 而不是自己翻 offered: 协议 → 鸣牌语义的翻译点
+        只有那一个, 两处各写一份迟早漂移.
+        """
+        if not tuning.NET_TURN_VETO:
+            return None
+        if (self._cfg.get("net_read") or tuning.NET_READ) == tuning.NET_READ_OFF:
+            return None
+        if self._net is None:
+            return None
+        try:
+            if not self._net.available():
+                return None
+            return bool(self._net.meld_options())
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return None
+
+    def _proto_round_open(self) -> bool | None:
+        """协议说"这一手还在打吗"(收局守卫的输入, 见 decide_turn.round_open).
+
+        **不看档位、不要求 available()** —— 它否决的只是"收局画面上的残留
+        出牌", 那种读数在任何档位都是幻觉; False 之外全都不参战(None).
+        """
+        if self._net is None:
+            return None
+        try:
+            return self._net.round_open()
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return None
+
+    def _proto_round_seq(self) -> int | None:
+        """协议开过几手了(单调递增). None = 协议不参战.
+
+        手间隙守卫用它区分"协议还停在这一手"和"协议已经翻到下一手" ——
+        `round_open` 说不了这件事(两种情况它都是 True), `round_id` 在连打
+        两场时又会重复(每场都从东一局 (0,0,0) 开), 只有计数器分得开.
+        """
+        net = getattr(self, "_net", None)
+        if net is None:
+            return None
+        try:
+            return net.round_seq()
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return None
+
+    def _net_fresh(self) -> bool:
+        """协议链路还在吗. **只问进程死活, 不问"多久没事件"**.
+
+        抓包是我们自己 spawn 的子进程, 活了就一定有数据可读(有没有事件是牌局
+        自己的事: 别家长考、我方吃碰杠/立直的选择窗口, 服务端本来就不发事件);
+        真死了由 `CaptureSupervisor.alive()` 报, 主循环会把 `self._net` 置空并
+        收工. 所以这里要回答的只是"还有没有协议可等", 而不是"喂料新不新鲜" ——
+        用超时反推新鲜度是那条 10s 误判的根源(见 tuning.NET_STALE_AFTER 的注释,
+        那不是这个问题该用的判据).
+
+        没起抓包(用户手动抓/USER 关掉 CAPTURE_AUTO)也返回 True: 那是用户的选择,
+        不能当成"坏了".
+        """
+        if getattr(self, "_net", None) is None:
+            return False
+        return not getattr(self, "_capture_broken", False)
+
+    def _hand_gap_arm(self) -> None:
+        """手间隙入闩: 视觉刚报"上一手结束"(DealWatch 的 rearmed 分支).
+
+        视觉的"手牌区空了"比协议的收局信号(Hule/NoTile)早到, 中间那一两秒里
+        摊牌/结算画面会被读成一手 14 张的散牌, 张数判据(14 % 3 == 2)照旧说
+        "轮到我", 协议那头 `offered` 也还是上一动的残留(同样说"轮到我") ——
+        两条判据一起假阳性, 于是对着幻影牌出牌并截一堆低置信存证.
+
+        **只在"协议还停在这一手"时才入闩**(2026-10-18 13:50 局实锤的死锁):
+        那一局我们刚点完「确认」进下一手, 视觉在结算→发牌的过场里看到手牌区
+        清空, `rearmed` 照样触发; 而入闩时协议**已经**翻到下一手了, 于是
+        "先见 round_open=False、再见 True"这个出口永远等不到 —— 整整 30 秒
+        不出牌, 雀魂直接把我们的 5z 托管打了出去.
+        判据用 `round_seq`: 它比"上一手开牌时是第几手"大, 就说明协议已经翻页,
+        这次 `rearmed` 是过场不是收局, 不入闩.
+        """
+        if not tuning.HAND_GAP_GUARD:
+            return
+        ro = _proto_round_open_of(self)
+        if ro is None:
+            return          # 协议不在这场对局里 -> 不参战, 维持纯视觉老行为
+        seq = self._proto_round_seq()
+        opened_at = getattr(self, "_round_seq_at_open", None)
+        if opened_at is None:
+            return          # 这一局还没开过手: 没有"收局残留"要防
+        if seq is not None and seq > opened_at:
+            return          # 协议已经翻到下一手: 过场, 不是收局
+        if not self._net_fresh():
+            return          # 抓包断了: 等不到出口信号, 入了就是锁死
+        self._hand_gap = True
+        self._gap_since = time.time()
+        # 收局信号已经先到了就别再等它一遍.
+        self._gap_saw_closed = (ro is False)
+
+    def _hand_gap_poll(self) -> bool:
+        """还在"上一手已结束、下一手还没开"的间隙里吗. True = 这一轮跳过.
+
+        出口**只看协议**: 先见到 round_open=False(收局信号到了), 再见到
+        round_open=True(下一手 ActionNewRound 到了). 反过来就是"视觉已经翻篇、
+        协议还没翻"的那段窗口, 那期间一律不出牌. 见 2026-10-18 东一局/东三局
+        实锤: 收局画面上读到 14 张散牌, 对着它算了 EV 并真点了 2z / 2m / 2s.
+        """
+        # 用 getattr: 单测把主循环绑到 SimpleNamespace 假对象上跑, 那些对象
+        # 没有这个字段(与 _shallow 同一套路).
+        if not getattr(self, "_hand_gap", False):
+            return False
+        ro = _proto_round_open_of(self)
+        if ro is False:
+            self._gap_saw_closed = True
+        elif ro is True and self._gap_saw_closed:
+            self._hand_gap_clear()
+            self.log_info("  协议报新的一手开了，手间隙结束，恢复决策")
+            return False
+        if not self._net_fresh():
+            # 抓包断了: 出口信号(收局 False -> 开局 True)永远不会来, 硬等
+            # HAND_GAP_TIMEOUT 就是把整手牌让给托管. 立刻退回视觉.
+            self.log_warning(
+                "  手间隙里抓包断了（桥不新鲜），等不到协议的收局/开局信号，"
+                "立刻退回纯视觉判断")
+            self._hand_gap_clear()
+            return False
+        if time.time() - self._gap_since >= tuning.HAND_GAP_TIMEOUT:
+            # 兜底(铁律: 宁可漏判不可锁死): 协议迟迟不给信号(桥断了/对面卡在
+            # 结算页/整场打完)就退回纯视觉老行为, 绝不把出牌永久拦死.
+            self.log_warning(
+                f"  手间隙等了 {tuning.HAND_GAP_TIMEOUT:.0f}s 没等到协议的收局"
+                f"/开局信号，退回纯视觉判断")
+            self._hand_gap_clear()
+            return False
+        return True
+
+    def _hand_gap_clear(self) -> None:
+        self._hand_gap = False
+        self._gap_since = 0.0
+        self._gap_saw_closed = False
+
+    def _capture_watch(self) -> bool:
+        """我们起的抓包进程还活着吗. 返回 True = 没死(或本来就没起).
+
+        抓包链路是**本任务 spawn 的**, 进程退了本来就该立刻知道, 不用等桥
+        的 stale_after 超时从"没新事件"反推 —— 那 10 秒里协议读数冻结在最后
+        一帧, 会被当成真值用. 见 capture.CaptureSupervisor.alive.
+        """
+        if not tuning.CAPTURE_WATCH:
+            return True
+        cap = getattr(self, "_capture", None)
+        if cap is None:
+            return True
+        try:
+            return cap.alive() is not False
+        except Exception:  # noqa: BLE001 - 监控本身永不拖垮主循环
+            return True
+
+    def _capture_down(self) -> None:
+        """抓包链路废了的处理: 切视觉 + 打完本局收工(见 _run_games).
+
+        `self._net = None` 一行就够 —— 现有 36 处 `_net is None` 守卫全部
+        自动生效, 纯视觉老路一字不改地恢复. 链路没起过(复用外部实例 /
+        CAPTURE_AUTO 关着)时不进这里: 那是用户的选择, 照常打完所有场次.
+        """
+        self._capture_broken = True
+        self._net = None
+        self.log_error(
+            "[抓包] mitmdump/mihomo 进程已退出，协议读数不再可信 ——"
+            "立刻切纯视觉，打完本局就收工（不再打剩余场次）。"
+            "排查见 docs/NET_CAPTURE.md §六")
+
+    def _proto_idle_skip(self) -> bool:
+        """协议说"现在什么都没给我、也不轮到我" -> 这一轮不抓帧, 睡过去.
+
+        见 tuning.NET_IDLE_SKIP. 任何拿不到都返回 False(多看一眼永远安全).
+
+        **跳帧前必须 poll 一次桥**(2026-10-17 真机实锤的"轮到我还傻等 9 秒"):
+        桥是 pull 式的, 只有 poll() 才读 spool 新事件; 跳帧路径原来只读不喂,
+        协议状态冻在上一帧 —— 摸了牌 my_turn 都翻了 True, 这里看的还是几秒前
+        的"什么都没给我", 于是一路睡到下一次睁眼(旧版是满 9 秒)才看见.
+        poll 一次只是 tail 一下 spool 文件, 微秒级, 每个跳帧轮都喂得起.
+
+        **没有"连跳 N 轮强制看一帧"了**(2026-10-18 删, 换成时间兜底): 那条
+        兜底每 9 秒睁一次眼, 正好落在立直自动摸切与局间结算这两种画面上, 读
+        出来的全是"13 张稳定读数"和"7 张残影". 见 tuning.NET_IDLE_LOOK_INTERVAL.
+
+        **只管"协议可用、且明确说没我的事"这一种情形**: 局间(available() False)
+        不在这里跳 —— 那几秒画面上是顺位面板, 要点头「确认」, 闭眼就点不了.
+        """
+        if not tuning.NET_IDLE_SKIP or self._net is None:
+            return False
+        net = self._net
+        try:
+            net.poll()
+            if net.available():
+                clock = net.turn_clock()
+                skip = not (clock.get("offered") or clock.get("my_turn"))
+                left = clock.get("left")
+                if (skip and isinstance(left, (int, float))
+                        and left <= tuning.NET_URGENT_SECONDS):
+                    skip = False
+            else:
+                # 局间(本手已收、下一手未开) **照常看**: 那几秒里画面上是
+                # "和了/流局"的顺位面板, 要点「确认」才会进下一手 —— 把眼睛
+                # 闭上就等于不点确认, 只能等下一次强制睁眼(旧版最多 9 秒,
+                # 2026-10-18 13:49 局就白等了那一段). 现在改由更下层挡:
+                #   - `_phase_hand_result` 认面板、点确认;
+                #   - `_phase_hand_gap` 在"协议已收局、这一手还没翻页"时不出牌;
+                #   - 结算残影的低置信帧/标注素材改由 `_proto_round_open_of`
+                #     说 False 时静音.
+                skip = False
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return False
+        if not skip:
+            self._idle_skip_since = 0.0
+            return False
+        self._idle_skips += 1
+        since = getattr(self, "_idle_skip_since", 0.0) or 0.0
+        if not since:
+            self._idle_skip_since = time.time()
+            return True
+        if time.time() - since >= tuning.NET_IDLE_LOOK_INTERVAL:
+            # 病态兜底: 协议可能把"下一手开了"漏掉了, 睁眼看一帧.
+            self._idle_skip_since = 0.0
+            return False
+        return True
+
+    # 这里原来有一个 `_chi_option_probe`: 遇上"一嘴吃有 2~3 种组合"就点一下
+    # 「吃」, 把雀魂的选择条拍下来验证划分, 然后**什么都不选**, 让服务端倒计时
+    # 把这嘴作废. 2026-10-18 删掉 —— 它只在友人场开, 但代价是实打实的:
+    #   - 面板一开, 服务端就不再发事件(它在等我们选), 那一嘴的 20~25 秒整段
+    #     停摆, 还正好是旧 stale 兜底要动手的窗口(见 tuning.NET_READ 下面那段);
+    #   - 用户当场看到的是"点了吃、弹出候选框、又不选", 一场里撞了两次
+    #     (14:30:38 三组合 / 14:32:17 两组合, 各停 24s).
+    # 现在策略里**根本没有吃**(MELD_POLICY="peng": 只碰役牌), 采样拿到的标签
+    # 换不来任何决策, 所以整条链路(点按钮/拍面板/写 chi_options)全部去掉.
+    # 划分算法本身还在 `src.mahjong.chi_panel`(纯函数 + 单测, 离线可用), 需要
+    # 采样时用真帧跑它, 不要在真机上点.
+    def _ev_plan(self):
+        """(候选, 牌山) —— 出牌决策与出牌记录共用的那一次估值.
+
+        只做取参, 逻辑在模块级 `_plan_ev`(单测会把它绑到假对象上跑).
+        顺带把"刚摸到的那一张"存到 `self._drawn_tile`: 视觉是 34 类, 认不出
+        赤 5, 而保留赤 5 必须知道刚摸的是不是赤(见 table.pick_tile_index).
+        """
+        rows, wall = _plan_ev(self._net, self._cfg, urgent=_urgent_now(self))
+        self._drawn_tile = self._proto_drawn()
+        return rows, wall
+
+    def _proto_drawn(self) -> str | None:
+        """协议说的"刚摸到的那一张"(带赤记号, 如 "0p"), 拿不到就是 None.
+
+        协议手牌的**末位**就是刚摸到的那张 —— 见 `net.state` 里 `hand` 那行
+        注释("暗手, 摸到的牌在末尾"), 项目本来就按这个约定在维护. 所以这里
+        不需要协议手牌与视觉手牌同序: 我们只问一张牌, 不问整个排列.
+        """
+        net = self._net
+        if net is None:
+            return None
+        try:
+            hand = (net.ev_inputs() or {}).get("hand") or []
+        except Exception:  # noqa: BLE001 - 读不到就不保留赤, 不影响出牌
+            return None
+        if len(hand) % 3 != 2:      # 14 张档才是"刚摸完牌"
+            return None
+        return hand[-1] if hand else None
+
+    def _ev_shadow(self) -> dict | None:
+        """影子档的出牌 EV 记录(`EV_EVAL_SHADOW`): 只写日志/jsonl, 不动手.
+
+        计算本身在 `_plan_ev` —— 接管档用的是**同一份**结果(见
+        tuning.EV_EVAL_TAKEOVER), 所以这里只管取数与打包.
+        """
+        if not tuning.EV_EVAL_SHADOW:
+            return None
+        # 用 getattr 而不是 self._net/_cfg: 单测把本方法绑到 SimpleNamespace
+        # 假对象上跑(那些对象只有这两个属性), 语义与"网络层永不拖垮主循环"一致.
+        rows, wall = _plan_ev(getattr(self, "_net", None),
+                              getattr(self, "_cfg", None),
+                              urgent=_urgent_now(self))
+        return _ev_record_of(rows, wall)
+
     def _play_one_game(self, cfg: dict, game: int) -> bool:
         """打完一局, 回到准备页返回 True; 超时/异常返回 False."""
         spec = self._resolve_spec(cfg)
         vision = self._ensure_vision()
+        # 网络读牌(liqi)对账门面: 整场共用一个(在 _run_games 里建好),
+        # 这里只在没建过时补建 —— 直调本方法的测试/脚本仍然可用.
+        # 桥不可用时一切对账静默回退视觉, 绝不拖垮主循环.
+        if self._net is None:
+            self._net = self._build_net(cfg)
+        self._net_log_at = 0.0
+        # 协议说"这一场完了"之后的计时起点(0 = 还没说过), 见下面的 1.6 分支.
+        self._game_over_since = 0.0
+        # 协议倒计时是否临近(每轮由 _net_clock 更新): 为真时压缩这一轮的节拍,
+        # 免得想太久被雀魂托管. 见 tuning.NET_TURN_CLOCK.
+        self._urgent = False
         deadline = time.time() + tuning.GAME_TIMEOUT
         # 开局宽限期: 点开始之后画面还要过加载 / 发牌动画, 这段时间手牌是
         # 逐张出现的(实测 0 张 -> 3 张 -> 12 张 -> 13 张, 前后约 10 秒).
@@ -434,20 +1161,23 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         # 合法张数), 于是每一轮都判成"在等别人", 一直空转到 game_timeout.
         # 判据见 src/vision.py 的 StuckDetector(为什么不用像素差也在那里).
         stuck = StuckDetector(tuning.STUCK_AFTER_TURNS)
-        unknown_streak = 0
-        turns = 0
-        # 立直之后必须打宣言牌. 点下立直那一刻置位, 真的少了一张才清掉.
-        pending_riichi = False
-        # 立直**已生效**(宣言牌打出、游戏确认了立直): 之后雀魂每回合自动
-        # 摸切, 我们的任何"选牌出牌"都是无效点击 —— 2026-10-07 19:16 实跑,
-        # 宣言后连打 2z/1m/7z/9s, 游戏里手牌全程冻结(turn 230~276 的 13 张
-        # 读数一字不差), 用户看到的就是"立直后一直尝试出牌". 上一版没有
-        # 这个状态: 宣言牌一打出, 任务就把立直忘了, 回到正常打牌逻辑.
-        riichi_active = False
-        # 连认几轮认不出宣言牌(立直后牌面模型偶尔认不到那个更矮的渲染).
-        # 认不出高亮牌的连续轮数(由 _bright_indices 自己累加), 超上限就
-        # 降级为按普通出牌处理, 免得无限空转到 game_timeout.
+        # 立直相关的两个状态机字段(意图 / 已生效)现在住在 RoundState 里,
+        # 与它们的注释一起 —— 见 src/tasks/hand_loop.py。
         self._riichi_misses = 0
+        # 立直意图的出生时刻(time.time()). 点下立直后超过
+        # tuning.RIICHI_DECLARE_TIMEOUT 还没打出宣言牌就放弃这个意图 ——
+        # 它挂了整手牌级别, 卡住不会自愈(见该常量的说明).
+        self._riichi_since = 0.0
+        # 立直生效的**协议证据**: 我们自己那一座位有没有真的收到
+        # LiQiSuccess. False = 还没看到(不等于没有), 只用来配合宽限期做反向
+        # 核对(见 tuning.RIICHI_VERIFY_GRACE), **绝不在验证那一刻否决**.
+        self._my_riichi_confirmed = False
+        # 立直**生效**的出生时刻(time.time()). 反向核对的宽限起点:
+        # 回执随下一次摸牌下发, 太早问必然问不到.
+        self._riichi_active_at = 0.0
+        # 协议空闲跳帧的连续计数(见 _proto_idle_skip 与 NET_IDLE_SKIP).
+        self._idle_skips = 0
+        self._idle_skip_since = 0.0
         self._cfg_riichi_patience = int(tuning.RIICHI_DECLARE_PATIENCE or 0)
         self._cfg_bright_inset = float(tuning.BRIGHT_INSET or 0.0)
         # 连续几轮"点了出牌但手牌一张没少". 这是唯一能**立刻**发现"点了没反应"
@@ -467,6 +1197,18 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         # 只看当前帧会让高置信误读绕过听牌摸切守卫(见 table.decide_turn
         # 第 8.0.5 步). 打出后/换手后复位.
         self._drawn_blurry = False
+        # 手间隙守卫(见 _hand_gap_arm / tuning.HAND_GAP_GUARD).
+        self._hand_gap = False
+        self._gap_since = 0.0
+        self._gap_saw_closed = False
+        # "这一手是协议的第几手"(见 _hand_gap_arm): None = 还没开过手.
+        self._round_seq_at_open = None
+        # 抓包链路已废(见 _capture_down): 切视觉 + 打完本局收工.
+        self._capture_broken = False
+        # 协议说的"刚摸到的那一张"(带赤记号, 如 "0p"). 保留赤 5 全靠它 ——
+        # 视觉是 34 类, 认不出赤, 只有协议说得清刚摸的是不是赤 5(见
+        # _proto_drawn 与 table.pick_tile_index). 桥不新鲜时恒为 None.
+        self._drawn_tile = None
         # 副露记账(2026-10-09 東2局实锤后新增): 我们读不到副露区, 从
         # "点碰/杠前手牌"与"之后稳定读数"的差集反推副露牌种(见
         # table.meld_taken_kinds). _melded_tiles 喂给决策层的加杠支持
@@ -524,408 +1266,79 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         # 后复位(下一段放弃再存). 2026-10-11 三人场连续两局在点完自动开关后
         # ~20s 闸门放弃(视觉上无从判断当时游戏显示的是什么), 没有这张帧只能瞎猜.
         self._gate_giveup_saved = False
-        # 多帧投票的缓存: 连续几帧各自 read_row 的结果, 用来压低置信度误识别.
-        vote_buffer: list[list] = []
+        # 协议手牌对不上时最近一次留证的时刻(0 = 还没存过), 限频见
+        # tuning.NET_TRUST_MISMATCH_SHOT_INTERVAL.
+        self._proto_mismatch_at = 0.0
+        # "协议张数与视觉张数互相矛盾"从哪一刻开始(0 = 现在没矛盾). 秒数用于
+        # 日志显示与留证阈值(NET_CONFLICT_SETTLE); **没有超时退视觉**(2026-10-18
+        # 20:21 局用户拍板): 退回去那一刻视觉可能还是假牌/动画框, 等成托管也
+        # 比点错牌强.
+        self._net_conflict_since = 0.0
         # "同一手牌里重复出现的同一条告警只报第一次"的去重表: 键 -> 上次的签名.
         # 每重臂一手(手牌区清空 -> 重新发牌)清空, 见 _log_repeat_once.
         self._repeat_log: dict[str, str] = {}
 
-        while time.time() < deadline:
-            # bench 挂钩(默认关闭): 记录主循环周期 + 固定时长到点落盘.
-            bench.tick_loop()
-            # 用户点了停止就立刻收工, 别再抓帧/点击(见 _should_yield 的说明:
-            # 框架的paused 标志不会自动打断任务代码, 必须显式问).
-            if self._should_yield():
-                self.log_info("收到停止指令, 中止本局")
-                return False
-            frame = self._grab()
-            if frame is None:
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
+        # 主循环拆到 src/tasks/hand_loop.py: 阶段序列 + 每轮状态.
+        # 这里只剩"这一局开始时的状态初始化"和"跑起来".
+        st = RoundState(cfg=cfg, game=game, spec=spec, vision=vision,
+                        deadline=deadline, stuck=stuck)
+        return HandLoop(self, st).run()
 
-            # 1) 回到准备页 = 这局结束了
-            #    判据用静态特征而不是开始按钮(见 _at_ready_page 的说明)
-            if self._at_ready_page(spec, cfg, frame):
-                self.log_info(f"第 {game} 局结束（回到准备页），共 {turns} 轮")
-                return True
+    def _net_riichi_seats(self) -> list[int] | None:
+        """协议里已立直的座位; 协议不可用/拿不到就返回 None(= 不否决).
 
-            # 1.5) 结算页 = 对局已经打完, 点"确认"回准备页.
-            #放在准备页判定之后, 读手牌之前: 结算页上根本没有手牌, 让牌面
-            # 模型去读只会读到牌河(实测 10 张), 决策全是"在等别人".
-            if self._handle_result_page(frame, cfg, spec, game, turns):
-                return True
+        **必须先 poll**: 桥是 pull 式的, 只读不喂拿到的永远是上一轮
+        `_net_step` 那一帧的冻结状态. 2026-10-18 真机: 立直回执随下一次摸牌
+        下发(比宣言牌晚 0.5s), 而本方法在验证那一刻读, 没有 poll 就看不到
+        —— 于是把一次**已经成立**的立直判成"没有回执"并撤销.
 
-            # 1.55) 终局奖励页(偶发弹窗, 2026-10-11 用户报): 盖住整块画面且
-            #       没有可匹配的按钮, 不点掉会一直卡着 —— 见
-            #       _handle_reward_page 的说明. 多数局不会命中, 一次
-            #       strict 定位(静态素材)的代价可以忽略.
-            if self._handle_reward_page(frame, cfg, game):
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
+        只读门面, 永不抛 —— 与网络层其它入口同一条原则.
+        """
+        if self._net is None:
+            return None
+        mode = self._cfg.get("net_read") or tuning.NET_READ
+        if mode == tuning.NET_READ_OFF:
+            return None
+        try:
+            self._net.poll()
+            if not self._net.available():
+                return None
+            state = getattr(self._net, "state", None)
+            seats = getattr(state, "riichi_seats", None)
+            return list(seats()) if callable(seats) else None
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            return None
 
-            # 1.7) 牌桌还没出来: 加载 / 对局开始页(写「胜负」那一页) / 和了过场.
-            #      这段时间手牌区里根本没有手牌, 让牌面模型去读只会得到
-            #      "只认出 0~3 张" + 一堆"按稳健出牌算"的噪音(实跑开局刷了
-            #      20 轮约 10 秒), 而且那些张数还可能撞上"合法张数"把人骗到
-            #      发牌动画里去出牌. 所以这里**整轮不感知也不决策** —— 判据
-            #      用静态的牌桌特征, 见 TABLE_SCREEN 的实测数值.
-            # bench 挂钩(默认关闭): 门控结果要留给下面的分支用, 先存局部.
-            gate = self._table_gate(cfg, frame)
-            if gate == TABLE_WAITING:
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
+    def _net_my_seat(self) -> int | None:
+        """协议里的"我的座位"; 拿不到返回 None."""
+        if self._net is None:
+            return None
+        try:
+            state = getattr(self._net, "state", None)
+            seat = getattr(state, "my_seat", None)
+            return int(seat) if seat is not None else None
+        except Exception:  # noqa: BLE001
+            return None
 
-            # 审计报告 G 节修改②(2026-10-10 实施): 牌桌特征失灵超过
-            # TABLE_WAIT_LIMIT 之后, **不再读手牌**。旧行为是"按旧逻辑裸读
-            # 继续打", 但连牌桌特征都认不出来时, 手牌区读到的只会是牌河 /
-            # 过场的幻觉牌(实测结算页牌河被读成 10 张"合法手牌"空转到超时,
-            # 就是同一类问题), 决策没有任何可信输入。这里整轮跳过感知与
-            # 决策, 靠外层 deadline(GAME_TIMEOUT)兜底不锁死; 上方的页面级
-            # 门控(准备页 / 结算页 / 一手结束)不受影响, 过场自己能走完。
-            # 计数进 bench(默认关), 量化这个兜底实际触发频率。
-            if gate in (TABLE_GAVE_UP, TABLE_IGNORING):
-                bench.count_state("table_gave_up_skip")
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
+    def _proto_my_riichi(self) -> bool | None:
+        """协议对我"这一手立直了没"的三态回答.
 
-            # bench 挂钩(默认关闭): 给接下来的手牌读数打阶段标签.
-            # "出牌阶段" = 发牌闸门已开且不在和了封锁; 除此之外的
-            # (发牌中 / 和了封锁)都是非出牌阶段的读手牌。
-            # (gave_up 不在此列: 上面的分支已经跳过, 放弃后不再读手牌。)
-            bench.set_phase(
-                "active" if (self._deal.opened and not self._deal.settling)
-                else "settling" if self._deal.settling else "deal_pending")
+        True = 拿到了我座位的立直回执 / False = **明确**没有 / None = 不参战.
+        **三态区分是这条的关键**: 桥不可用、座位表还没建、不知道我是哪个
+        座位, 三种"拿不到"都必须是 None —— 拿沉默当反对会把一次真立直
+        撤销掉, 而撤销之后的代价是"整手不再主动出牌"(靠雀魂托管收尾).
 
-            # 1.75) 一手结束的顺位结算画面(和了/流局后): 点「确认」过场,
-            #       这一轮不读手牌 —— 这画面上手牌行被面板遮着, 读数全是
-            #       "9~11 张 + 空档"的假警报(见 HAND_RESULT_SCREEN 的说明).
-            if self._handle_hand_result(frame, cfg, game):
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-
-            hand = self._read_hand_voted(vision, frame, cfg, vote_buffer)
-            buttons = vision.read_buttons(frame)
-            button_conf = {name: boxes[0].conf for name, boxes in buttons.items()}
-
-            # 立直选牌态: 点下立直后雀魂让**能打的牌高亮, 其余变暗**, 此时
-            # 点一张高亮牌即完成立直宣言(用户指出, 见 log t76~t83 复核).
-            # 我早先以为"雀魂指定了宣言牌并特殊渲染", 那是错的 -- 实跑里
-            # t78~t82 点的都是变暗的牌, 雀魂不响应, 手牌数一直是 14.
-            # 所以这里算的是"哪些牌高亮", 牌效只在这些牌里挑最优.
-            allowed = (self._bright_indices(frame, hand) if pending_riichi
-                       else None)
-
-            # 低置信槽位: 牌面模型认不准的牌. 这些槽位会喂给 decide_turn 走
-            # **稳健出牌** -- 枚举它们可能的真实取值, 挑一张怎么认都不踩坑的
-            # 打(见 src/mahjong/brain.py::robust_discard).
-            #
-            # 这里曾经试过"有低置信就整轮不出牌, 等下一帧认准", 数据上已证伪
-            # 并删掉: 位置 4 在 turn 176~185 连续 10 轮输出同一个错类别,
-            # conf 稳定在 0.64~0.67, 等多久都不恢复 -- 实测那样会有 73% 的
-            # 时间在空等, 节奏全拖垮了. 而误识牌从不被直接点(6 个已证实误识
-            # 里只有 1 个点了低置信那张), 真正的问题是它污染了全局判断.
-            blurry = (low_confidence(hand.boxes, float(blur))
-                      if (blur := tuning.MIN_TILE_CONF) else None)
-            if blurry:
-                self._log_repeat_once(
-                    "blurry",
-                    "|".join(f"{i}:{hand.boxes[i].label}" for i in blurry),
-                    f"  槽位 {blurry} 置信度偏低"
-                    f"（{', '.join(f'{hand.boxes[i].label} {hand.boxes[i].conf:.2f}' for i in blurry)}），"
-                    f"这一轮按稳健出牌算")
-            # 刚摸的牌(最右槽)低置信 -> 置粘性标志(打出前不清): 听牌摸切
-            # 守卫的输入, 见 table.decide_turn 第 8.0.5 步. count % 3 == 2
-            # = 这是"摸牌后"的张数(14/11/8/5/2), 最右槽就是刚摸的那张.
-            if (hand.count % 3 == 2 and blurry
-                    and len(hand.tiles) - 1 in blurry):
-                self._drawn_blurry = True
-            # 按间距看出来的漏认: 和置信度无关, 张数可能整个是错的.
-            # 必须一路传到决策层, 否则它会拿一个巧合合法的张数(10)去判
-            # "是不是轮到我", 得出"在等别人"然后静默空转(见 table.decide_turn).
-            if hand.missing_slots:
-                self._log_repeat_once(
-                    "missing",
-                    f"{hand.missing_slots}:{hand.count}",
-                    f"  手牌行里有约 {hand.missing_slots} 张牌的空档（只认出 "
-                    f"{hand.count} 张），张数不可信",
-                    level="warning")
-
-            # 副露记账: 刚点过碰/杠且读数已稳定(张数比点击前至少少 2 --
-            # 碰拿走一对, 杠只会更多), 从差集反推副露牌种(见
-            # table.meld_taken_kinds). 这是决策层加杠支持判据的输入.
-            if (self._pre_meld is not None
-                    and time.time() - self._pre_meld_at
-                    > tuning.PRE_MELD_TIMEOUT):
-                # 对账超时: 点击后从没数出"少 2 张以上" —— 加杠(只挪 1 张,
-                # 不增加副露组数)或按钮没点上. 放弃对账, 不然 _pre_meld 会
-                # 挂到这一手结束, 把张数硬校验和后续对账一起堵死.
-                self._log_repeat_once(
-                    "pre_meld_expire", f"{len(self._pre_meld)}",
-                    "  副露对账超时（可能是加杠或按钮没点上），放弃本次对账")
-                self._pre_meld = None
-            if (self._pre_meld is not None and not hand.missing_slots
-                    and len(hand.tiles) <= len(self._pre_meld) - 2):
-                for t in meld_taken_kinds(self._pre_meld, hand.tiles):
-                    if self._melded_tiles.count(t) < 3:
-                        self._melded_tiles += [t] * 3
-                self._pre_meld = None
-                # 数出了"少 2 张以上" = 真的鸣进一组, 组数 +1(纯按手数,
-                # 加杠/没点上到不了这里). max 防任何一边多记.
-                self._meld_count = max(self._meld_count + 1,
-                                       len(self._melded_tiles) // 3)
-
-            decision = decide_turn(
-                hand.tiles, button_conf,
-                player_count=spec.player_count,
-                meld_policy=tuning.MELD_POLICY,
-                allow_riichi=tuning.ALLOW_RIICHI,
-                meld_min_conf=tuning.MELD_BUTTON_MIN_CONF,
-                babei_policy=tuning.BABEI_POLICY,
-                allowed_indices=allowed,
-                blurry_indices=blurry,
-                robust_discard_enabled=cfg["robust_discard"],
-                missing_slots=hand.missing_slots,
-                button_centers={name: self._box_center(boxes[0])
-                                for name, boxes in buttons.items()},
-                blurry_draw=self._drawn_blurry,
-                melded=self._melded_tiles,
-                rng=self._rng,
-            )
-            turns += 1
-            # 把**这一帧**一起传进去存证, 别让 _record_turn 自己再抓一张
-            # (抓到的已经是下一轮的画面, 留证帧会和日志里的 hand 对不上).
-            self._record_turn(game, turns, hand, buttons, decision, frame)
-
-            # 1.8) 这一手到底还在不在打? 两种"不在打"都要拦住:
-            #
-            #   a) 发牌还没结束. 发牌动画期间手牌逐张出现, 中间那些张数会撞上
-            #      "合法张数"(8 = 2 副露的暗牌数), 决策层以为轮到自己, 照着一手
-            #      没发完的牌算出出牌 —— 实跑里几乎每一局的**第一手**都是这么
-            #      打出去的(见 table.deal_is_done).
-            #   b) 上一手已经结束. 和了之后的摊牌动画里, 我们自己的和了牌是
-            #      **正面朝上**摆着的, 读出来是一手干净的 13~14 张, 只看张数
-            #      完全像正常打牌 —— 实跑 t190/t191/t195 就在摊牌动画里打了
-            #      3 次牌.
-            #
-            # 两个 bug 的根因是同一个: 把"一手牌的状态"当成了"整场任务的状态".
-            # 一次 _play_game 跑的是**整场**(东风局/半庄, 中间会连着开好几手),
-            # 所以闸门必须按"手"重臂 —— 详细论证与实测数值见 table.DealWatch.
-            state = self._deal.see(hand.count, hand.missing_slots, time.time(),
-                                   melded=self._kan_pending)
-            if state.just_opened:
-                self._hand_seq += 1
-                self.log_info(f"  手牌发齐了（{hand.count} 张），开始按正常逻辑打"
-                              f"—— 第 {self._hand_seq} 手开局")
-                # 开局记录(2026-10-11 用户提议): jsonl 里显式记每一手的起点,
-                # 配合 hand_end 就能离线对齐"每一手的张数/副露数/决策"时间线.
-                self._record({"event": "hand_start", "game": game,
-                              "seq": self._hand_seq, "count": hand.count,
-                              "melds": self._meld_count})
-                # 双保险归零: 重臂已经清过一次, 这里再清 —— 发齐 13 张的
-                # 一手副露必然为 0(副露得等别人先打牌), 万一重臂边沿被
-                # 加速过场跳掉, 这道闸保证副露记账不会跨手污染.
-                self._meld_count = 0
-                self._count_mismatch_streak = 0
-                # 新一手的第一件事: 把左上「和/鸣/(拔)」自动开关点亮(幂等,
-                # 已确认过就只是三块小区域各读一次颜色). 「鸣」按本手手牌
-                # 动态决定: 有役牌对子就不点(让碰机会活着), 没有就点(自动拒).
-                #
-                # 役对判定**不能只看一帧**(22:57 局实锤): just_opened 那帧
-                # 把 7z 误读成 6z, 幻影"白板对"让整手没点「鸣」—— 鸣牌机会
-                # 于是全靠我们手动应答, 一旦被双标签守卫卡住就被托管吃牌
-                # (用户报的"没点鸣, 还在吃牌"). 这里再读一帧, **两帧都见
-                # 役对**才让「鸣」保持关闭: 单帧幻影的代价只是这手少碰一次
-                # (无实损), 而错误地不开「鸣」的代价是被托管接管应答.
-                bench.set_phase("active")  # bench 挂钩: 发齐了, 属出牌阶段
-                _, hand2 = self._read_hand_frame()
-                yaku1 = has_yaku_pair(hand.tiles, hand.missing_slots,
-                                      tuning.ROUND_WIND)
-                yaku2 = (has_yaku_pair(hand2.tiles, hand2.missing_slots,
-                                       tuning.ROUND_WIND)
-                         if hand2 is not None else yaku1)
-                self._ensure_auto_toggles(cfg, frame, yaku1 and yaku2)
-            if state.rearmed:
-                self.log_info("  上一手已结束（手牌区清空），发牌闸门重新上膛"
-                              f"—— 第 {self._hand_seq} 手结束，本手副露 "
-                              f"{self._meld_count} 组")
-                self._record({"event": "hand_end", "game": game,
-                              "seq": self._hand_seq,
-                              "melds": self._meld_count})
-                # 换了一手牌, 上一手的"这条已经报过"不该继续生效.
-                self._repeat_log.clear()
-                # 雀魂的自动开关**每一手都重置回关**(实跑 2026-10-08: 一局 6 手
-                # 只在第 1 手点了「和/鸣」, 后面 5 手全是关的) —— 所以换手必须
-                # 复位, 让 just_opened 时的 _ensure_auto_toggles 真的去点.
-                self._toggles_ok = False
-                # 新的一手行里没有杠牌(杠牌只属于一手), 剥离逻辑退场.
-                self._kan_pending = False
-                # 新的一手 = 副露记账归零(副露只属于一手).
-                self._melded_tiles = []
-                self._pre_meld = None
-                # 副露组数与张数校验状态同归零(见 _hand_count_ok).
-                self._meld_count = 0
-                self._count_mismatch_streak = 0
-                # 新的一手 = 立直状态归零(立直只属于一手; 流局/别人和了后
-                # 游戏自动开下一手, 我们没立直就得正常打).
-                riichi_active = False
-                pending_riichi = False
-                # 新的一手 = 摸牌模糊标志归零(属于"这一次摸牌").
-                self._drawn_blurry = False
-            if state.gave_up:
-                self.log_warning(
-                    f"和了之后 {tuning.GAME_GRACE_PERIOD:.0f}s 没等到结算页，"
-                    f"退回旧行为继续打。若反复出现，请把 logs 和留证帧发出来")
-            if not state.done and decision.action in DEAL_BLOCKED_ACTIONS:
-                self.log_info(
-                    f"  这一手没在进行中（手牌 {hand.count} 张，闸门未开），"
-                    f"这一轮不{decision.action}")
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-
-            # 1.7.5) 张数硬校验(2026-10-11 用户提议落地, 三碰局实锤的洞):
-            # 记住了本手的副露组数, 暗牌数就只有 13-3n / 14-3n 两个合法值.
-            # 读数张数落在集合外 = 读数被污染(副露混进手牌 / 漏认 / 幻觉),
-            # 这一轮什么都不做 —— 特别是不出牌: 三碰局里 8 张恰好 %3==2,
-            # 决策层判"该我出牌"然后反复想打已碰掉的牌, 就是缺这道闸.
-            # 只在闸门已开(state.done)后执行: 发牌动画期的过渡张数由闸门管.
-            if state.done and not self._hand_count_ok(hand, frame):
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-
-            # 2) 卡死检测. 放在决策之后, 因为它需要知道"这一轮有没有动手".
-            #    开局宽限期内不算: 发牌动画期间手牌是逐张出现的, 张数本来就在变.
-            if time.time() >= self._deal.grace_until and stuck.feed(
-                hand.count, set(buttons), acted=decision.action != ACTION_WAIT
-            ):
-                self._save_unknown_page(
-                    frame, f"连续{stuck.same_count}轮无变化_疑似对局已结束")
-                self.log_warning(
-                    f"连续 {stuck.same_count} 轮感知结果完全一样（手牌 "
-                    f"{hand.count} 张、按钮 {sorted(buttons) or '无'}）且没有任何动作，"
-                    f"判定这局已经结束但页面没认出来（多半是结算页），已截图留证。"
-                    f"请用「截图标注」框出结算页的特征区域。")
-                return True
-
-            if decision.action == ACTION_WAIT:
-                # "在等别人"是每局几十轮的正常状态, 不算"认不出来";
-                # 只有 suspect(张数不对 / 认出怪牌 / 牌效算不动)才计数.
-                if decision.suspect:
-                    if time.time() < self._deal.grace_until:
-                        pass                    # 开局动画期, 正常
-                    elif not hand.reliable:
-                        # 读数本身不可信(有空档)时不计数也不留证: 一手结束的
-                        # 顺位结算画面(流局那种没有「确认」按钮的)读数就是
-                        # 9~11 张 + 空档, 拿它当"无法识别"存了 3 张无用截图
-                        # (2026-10-08 实跑). 真正卡住的页面由 StuckDetector
-                        # 兜底, 那条路不看手牌读数.
-                        pass
-                    else:
-                        unknown_streak += 1
-                        if unknown_streak == tuning.UNKNOWN_PAGE_AFTER:
-                            self._save_unknown_page(
-                                frame, f"对局内无法识别_{decision.reason}")
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-
-            # 连点都没反应时**这一轮不再点**. StuckDetector 看不到这种情况
-            # (它要求"这 N 轮没有任何动作", 而我们每轮都在点), 所以 2026-10-07
-            # 那次画面冻住之后照样盲点同一张牌, 一直空转到 40 轮才兜底, 而且
-            # 把雀魂的「确定要离开房间吗？」模态框点了出来. 现在 3 轮(≈1 秒)
-            # 就留证并停一手 —— 停下来本身还让 StuckDetector 有机会触发。
-            if (decision.action == ACTION_DISCARD
-                    and self._discard_misses >= tuning.DISCARD_MISS_LIMIT):
-                self._save_unknown_page(
-                    frame, f"连续{self._discard_misses}轮出牌没打出去")
-                self.log_warning(
-                    f"连续 {self._discard_misses} 轮点了出牌但手牌一张没少，"
-                    f"已截图留证。多半是画面上压着模态框（如「确定要离开房间吗？」）"
-                    f"或画面冻住了，雀魂根本没收到点击。这一轮先不动，下一轮重新认。")
-                self._discard_misses = 0
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-
-            unknown_streak = 0
-            # 这一轮的出牌是不是"立直选牌态里的宣言牌": 只有选牌态真的被
-            # 认出来(allowed 非 None)且**不是**耐心耗尽后的降级(那时
-            # _riichi_misses 已累计), 才算数. 点了立直但游戏没进选牌态
-            # (点立直失败/被取消)时 allowed 是 None, 那种出牌是普通出牌.
-            declare_turn = (pending_riichi and allowed is not None
-                            and self._riichi_misses == 0)
-            # 立直状态机: 点下立直 -> 必须先打宣言牌 -> 真的少了一张才清位.
-            # 清位判据是**手牌数**, 不是"这一轮决定了 DISCARD": 雀魂在立直后
-            # 只认宣言牌, 点错的地方它直接忽略, 手牌数不会变. 早先只看
-            # decision.action 就清位, 结果点失败一次就把立直状态丢了, 下一轮
-            # 又按牌效去算 -- 正是实跑里"连点 5 轮同一张牌"的成因.
-            if decision.action == ACTION_RIICHI:
-                pending_riichi = True
-                self.log_info("  立直已宣布, 接下来必须打宣言牌")
-            elif (pending_riichi and decision.action == ACTION_DISCARD
-                    and not declare_turn):
-                # 点了立直但游戏没进选牌态(立直没点成): 这一轮按普通出牌
-                # 打掉, 立直意图作废, 回到正常打牌.
-                pending_riichi = False
-            if riichi_active and decision.action == ACTION_DISCARD:
-                # 立直生效后雀魂自动摸切: 忽略出牌决策(点了也是无效点击),
-                # 也不必再"选牌". 杠(立直中的暗杠)/和了/确认不受影响.
-                self._log_repeat_once(
-                    "riichi_auto", "active",
-                    "  立直生效中：雀魂自动摸切，不主动出牌")
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-            # 1.9) 动作前双帧一致性确认(2026-10-08 用户提议"多截几次取
-            #      最稳"落地): 这几次实跑的错动作(过场画面乱出牌 / 滑入
-            #      动画期漏碰)全都发生在"牌桌还没稳定下来"的时候, 而幻觉
-            #      读数和动画帧撑不过第二帧 —— 所以决策出来后等一小段,
-            #      重抓一帧用同参数重算一遍, 两帧一致才动手; 不一致就本轮
-            #      不动, 回主循环重新决策(每 0.3s 一轮, 天然重试, 不会锁死;
-            #      真正稳定的画面下一轮必然通过). 判据见 table.action_confirmed.
-            #      副产品: meld 只会在按钮滑入结束(位置稳定)后才点, 动画期
-            #      的低置信帧从此不在决策窗口里; 第一帧漏认 peng 误判"跳过"
-            #      时, 第二帧认出 peng 会让两帧不一致, 真机会不会被 skip 掉.
-            ok, why = self._confirm_stable(decision, hand, buttons, cfg,
-                                           spec, vision, vote_buffer,
-                                           pending_riichi)
-            if not ok:
-                self._log_repeat_once(
-                    "unstable", decision.action,
-                    f"  画面还没稳定（{why}），本轮不动，下一轮重新决策")
-                self.sleep(tuning.TURN_POLL_INTERVAL)
-                continue
-            self._execute(decision, hand, buttons, cfg, game, turns)
-            # 点完把光标停到安全区: 光标趴在手牌上, 悬停的牌会被游戏顶起来,
-            # 实跑里正好挡住立直按钮的模板(2026-10-07 21:41); 光标箭头本身
-            # 也不该出现在下一轮的手牌读数里.
-            self._park_mouse(frame)
-
-            # 和了之后这一手就结束了, 但雀魂还会放一段摊牌动画(我们自己的和了牌
-            # 正面朝上摆回手牌位置, 摊牌期间读出来是干净的 13~14 张, 只看张数
-            # 跟正常打牌没区别), 然后才是结算页. 实跑 t189 点了自摸之后,
-            # t190/t191/t195 又"打"了 3 次牌 —— 所以这里必须显式封锁,
-            # 否则那段动画里会一直点手牌区. 解除条件与兜底见 table.DealWatch.
-            if decision.action == ACTION_WIN:
-                self._deal.agari(time.time())
-                self.log_info("  和了，等摊牌 / 结算过完，期间不再读手牌和出牌")
-
-            # 出牌后重新看一眼手牌: 真的少了一张才算把宣言牌打出去.
-            # _discard 内部已经会为"选中再确认"再点一次, 所以这里读到的
-            # 已经是最终结果.
-            if declare_turn and decision.action == ACTION_DISCARD:
-                self.sleep(tuning.DISCARD_VERIFY_DELAY)
-                # 同 _discard: 残帧会让读数比稳定态少一张, 而这里的判据正是
-                # "少没少", 复读一次再判, 免得把打出去的宣言牌判成没打出去.
-                _frame, after = self._read_hand_retry(hand.count - 1)
-                if after is not None and after.count < hand.count:
-                    self.log_info(
-                        "  宣言牌已打出，立直生效：之后每回合雀魂自动摸切，"
-                        "不再主动出牌")
-                    pending_riichi = False
-                    riichi_active = True
-                    self._riichi_misses = 0
-
-        frame = self._grab()
-        self._save_unknown_page(frame, f"第{game}局超时")
-        self.log_error(f"第 {game} 局超时（{tuning.GAME_TIMEOUT}s），已截图留证")
-        return False
+        False 这一支才允许做否决, 且调用方还要再叠一道
+        `tuning.RIICHI_VERIFY_GRACE` 宽限: 回执是随下一次摸牌下发的, 刚打完
+        宣言牌那一刻**本来就不该有**.
+        """
+        seats = self._net_riichi_seats()
+        if seats is None:
+            return None
+        mine = self._net_my_seat()
+        if mine is None:
+            return None
+        return mine in seats
 
     def _bright_indices(self, frame, hand) -> list[int] | None:
         """立直选牌态里哪些牌是高亮的(能点的); 不在选牌态返回 None.
@@ -971,76 +1384,19 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         self._riichi_misses = 0
         return bright
 
-    def _read_hand_voted(self, vision: GameVision, frame, cfg: dict,
-                         buffer: list) :
-        """读手牌, 并按配置做多帧投票压掉低置信度误识别.
+    def _read_hand(self, vision: GameVision, frame, cfg: dict):
+        """读手牌: 剥离杠牌暂存区 + 低置信留证. 标签一律交给协议对账纠正.
 
-        **为什么需要**(2026-10-06 立直那局的实测): 牌面模型对某些位置的牌
-        置信度只有 0.60~0.74, 同一张牌在连续帧里会在两个类别之间来回跳.
-        实测 585 轮里index=4 的跳变率 2.2%, 是全手牌最高的(其余多在0.3%).
-        后果很具体: 系统会认真算出"牌效最优"的牌, 但那张牌根本不是屏幕上
-        那张, 于是点下去打不出去 -- 实跑里连点5 轮, 手牌数一直是 14.
-
-        **为什么不靠调高 TILE_CONF**: 实测 1244 个框里真牌最低 0.433,
-        而 0.40~0.75这一档**既有真牌也有误识**. 单纯抬阈值会把真牌整个丢掉,
-        丢牌的危害比认错更严重(张数立刻不对, 整轮判成"认漏了"→ 假警报).
-        投票是只在"多帧不一致"时才改变结果的补丁, 不动主阈值.
-
-        buffer 复用同一个list, 避免每轮新建(它是热路径). 每次调用推进一格,
-        只保留最近 hand_vote_frames 帧. 手牌张数变了(摸牌/出牌/副露)就清空
-        -- 那种情况下前后两帧的槽位根本不是同一张牌, 投票没有意义.
+        历史上这里还有一层"多帧投票"(连续几帧同一槽位取众数)压低置信误识,
+        2026-10-18 整体删除: 投票改动的是**标签**, 而用户的拍板是"标签只有
+        协议一个来源, 视觉不一致时保留截图" —— 投票与协议对账叠着跑, 等于
+        在协议真值之上再叠一层视觉猜想. 15:21 局(日志写打 3p 实际 4p)与
+        16:21 局("纠正4槽"后点 9p 打出 4p)都是它把标签推了一格造成的.
+        低置信槽位的真正出路是决策层的稳健出牌(见 detection.low_confidence).
         """
         hand = self._strip_kan_setaside(vision.read_hand(frame))
         self._save_low_conf_frame(frame, hand)
-        frames = int(tuning.HAND_VOTE_FRAMES or 0)
-        if frames <= 1:
-            buffer.clear()
-            return hand
-
-        prev = buffer[-1] if buffer else None
-        # 摸牌帧(13->14, 11->8, 8->5): 前 n-1 张是**原来就在屏上的同一批牌**,
-        # 雀魂摸牌只把新牌放到右端独立位, 原 13 张位置不动 -> 前缀槽位一一对
-        # 应, 可以对齐投票; 新摸的最后一槽没有历史, 用当帧原读.
-        # 2026-10-11 東1局9巡实锤(牌谱核对): 摸牌帧槽5 8p 被读成 1s(conf 0.95),
-        # 而**张数一变缓冲就清空, 决策帧恰好永远是裸单帧** -> 按误读手牌打了
-        # 9p(真实手牌最优是打 5p). 8p<->1s 在 20:16:17-25 之间来回翻转了两次,
-        # 等待帧都有投票保护, 唯独决策帧没有 -- 本修复把这个洞补上.
-        # 其余张数变化(出牌后重排/副露)槽位内容会换牌, 仍然清空.
-        drew = (prev is not None and len(prev) == len(hand.boxes) - 1
-                and len(hand.boxes) % 3 == 2)
-        if prev is not None and len(prev) != len(hand.boxes) and not drew:
-            buffer.clear()
-        buffer.append(hand.boxes)
-        if len(buffer) > frames:
-            del buffer[0]
-
-        if len(buffer) < 2:
-            return hand
-        labels = vote_labels(list(buffer))
-        if (drew and labels is not None
-                and len(labels) == len(hand.boxes) - 1):
-            labels = list(labels) + [hand.boxes[-1].label]
-        return self._voted(hand, labels, cfg)
-
-    def _voted(self, hand, labels, cfg: dict):
-        """把投票结果套回 HandReading; 投票无效或无变化时原样返回.
-
-        真正的搬迁在 `src.detector.with_voted_labels`(用 replace 保证除
-        标签外的字段一个都不丢, 尤其是 `missing_slots`). 这里只负责日志。
-
-        日志里的置信度是**当前帧**那个框的观测值, 不是投票选中的那个框的
-        —— 投票只改"这张牌叫什么", 几何和置信度都是当帧的事实, 见 vote_labels.
-        """
-        if labels is None or len(labels) != len(hand.boxes):
-            return hand
-        changed = [(i, hand.boxes[i].label, labels[i],
-                    round(hand.boxes[i].conf, 3))
-                   for i in range(len(labels)) if labels[i] != hand.boxes[i].label]
-        if changed:
-            self.log_info(f"  多帧投票纠正了 {len(changed)} 张牌: "
-                          + ", ".join(f"#{i} {a}->{b}(当帧置信 {c})"
-                                      for i, a, b, c in changed))
-        return with_voted_labels(hand, labels)
+        return hand
 
     def _log_repeat_once(self, key: str, signature: str, message: str,
                          level: str = "info") -> None:
@@ -1350,7 +1706,7 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         present = self._at_table(cfg, frame)
         if not present and self._table_watch.gone_since == 0.0:
             self.log_info(
-                f"还没进牌桌（加载 / 对局开始页 / 过场），等牌桌出来再读手牌")
+                "还没进牌桌（加载 / 对局开始页 / 过场），等牌桌出来再读手牌")
         state = self._table_watch.see(present, time.time(),
                                       limit=tuning.TABLE_WAIT_LIMIT)
         if state == TABLE_GAVE_UP:
@@ -1363,6 +1719,21 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         elif present:
             self._gate_giveup_saved = False
         return state
+
+    def _save_proto_mismatch(self, frame, note: str) -> None:
+        """协议手牌与视觉对不上: 留一张现场帧(限频), 本轮照旧走视觉.
+
+        信任档(NET_TRUST_PROTO)的失败方向必须是"看得见": 悄悄回退 = 协议漂移
+        (某条报文漏记/多记一张牌)永远不会被发现, 而"信任协议"恰恰建立在
+        "它被持续核对"上. 走 _save_unknown_page(待标注_ 前缀, 不会被修剪),
+        与 frame_gate_/frame_lowconf_ 同属保留帧.
+        """
+        now = time.time()
+        if (now - getattr(self, "_proto_mismatch_at", 0.0)
+                < tuning.NET_TRUST_MISMATCH_SHOT_INTERVAL):
+            return
+        self._proto_mismatch_at = now
+        self._save_unknown_page(frame, f"协议手牌对不上 {note[:60]}")
 
     def _save_gate_giveup_frame(self, frame) -> None:
         """闸门放弃时留一张现场帧(一次放弃段只存第一张, 牌桌恢复后重新武装).
@@ -1386,21 +1757,24 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             self.log_warning(f"  闸门现场帧保存失败: {e}")
 
     def _confirm_stable(self, decision, hand, buttons, cfg: dict, spec,
-                        vision: GameVision, vote_buffer: list,
-                        pending_riichi: bool) -> tuple[bool, str]:
+                        vision: GameVision,
+                        pending_riichi: bool, ev_rank=None) -> tuple[bool, str]:
         """动作前抓第二帧重算一遍, 判据在 table.action_confirmed(纯逻辑).
 
-        第二帧的输入完全镜像主循环那一轮: 同样的读手牌(含投票/杠牌剥离)、
+        第二帧的输入完全镜像主循环那一轮: 同样的读手牌(杠牌剥离)、
         读按钮、高亮牌、低置信槽位, 只是 rng 换成固定种子 —— 同一读数下
         决策必须可复现, 否则"要打的牌变了"会被随机性(5% 次优)误触发.
-        投票缓冲区复用同一个 list: 第二帧也是一帧真实画面, 推进一格是
-        它应得的(和下一轮主循环读帧没有区别).
         """
+        if _urgent_now(self):
+            # 协议倒计时快到了: 二次确认还要再花 ~0.55s + 抓一帧, 这一轮花不起.
+            # 有协议时钟兜底的时候, "按老样子直接动手"也比被托管强 —— 托管会
+            # 替我们连吃带碰还乱打. 见 tuning.NET_URGENT_SECONDS.
+            return True, "协议倒计时快到了，跳过二次确认"
         self.sleep(tuning.STABLE_CONFIRM_DELAY)
         frame2 = self._grab()
         if frame2 is None:
             return False, "二次抓帧失败"
-        hand2 = self._read_hand_voted(vision, frame2, cfg, vote_buffer)
+        hand2 = self._read_hand(vision, frame2, cfg)
         buttons2 = vision.read_buttons(frame2)
         conf2 = {name: boxes[0].conf for name, boxes in buttons2.items()}
         centers2 = {name: self._box_center(boxes[0])
@@ -1420,29 +1794,62 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             meld_policy=tuning.MELD_POLICY,
             allow_riichi=tuning.ALLOW_RIICHI,
             meld_min_conf=tuning.MELD_BUTTON_MIN_CONF,
+            riichi_min_conf=tuning.RIICHI_BUTTON_MIN_CONF,
             babei_policy=tuning.BABEI_POLICY,
             allowed_indices=allowed2,
             blurry_indices=blurry2,
-            robust_discard_enabled=cfg["robust_discard"],
             missing_slots=hand2.missing_slots,
                 button_centers=centers2,
                 blurry_draw=self._drawn_blurry,
                 melded=self._melded_tiles,
+                # 镜像第一帧的协议权威闸: 两帧必须同参, 否则"动作变了"
+                # 会被闸门差异误触发(见 action_confirmed 的判据).
+                my_turn=_proto_turn_of(self),
+                proto_turn=_proto_clock_turn_of(self),
+                round_open=_proto_round_open_of(self),
+                # 第二帧沿用第一帧那份 EV 排序: 同一手里的牌河/宝牌/牌山不会在
+                # 0.4s 里变, 而 pick_by_ev_rank 会按第二帧的读数落地 —— 两帧
+                # 同参才不会把"目标函数不同"误判成"要打的牌变了".
+                ev_rank=ev_rank,
                 rng=random.Random(0),
+                drawn_tile=getattr(self, "_drawn_tile", None),
             )
         center1 = None
         if decision.button:
             boxes1 = buttons.get(decision.button) or []
             center1 = self._box_center(boxes1[0]) if boxes1 else None
-        return action_confirmed(decision, second, center1,
-                                centers2.get(decision.button),
-                                tol=tuning.BUTTON_STABLE_TOL)
+        ok, why = action_confirmed(decision, second, center1,
+                                   centers2.get(decision.button),
+                                   tol=tuning.BUTTON_STABLE_TOL)
+        if not ok:
+            # 把两帧的差异摊开报: 只有"动作变了"三个字时, 事后无法区分到底是
+            # 按钮漏检(视觉问题)还是手牌读数抖了(感知问题)、还是协议闸翻转.
+            # 2026-10-18 14:58 局就是只留了三个字, 复盘只能靠猜.
+            why += (f"；第一帧 {decision.action}/{decision.button or '-'}"
+                    f" 手牌 {getattr(hand, 'count', '?')} 张"
+                    f"(空档 {getattr(hand, 'missing_slots', '?')},"
+                    f" 按钮 {sorted(buttons) or '无'}),"
+                    f" 第二帧 {second.action}/{second.button or '-'}"
+                    f" 手牌 {hand2.count} 张(空档 {hand2.missing_slots},"
+                    f" 按钮 {sorted(buttons2) or '无'})")
+        return ok, why
 
     def _execute(self, decision, hand, buttons, cfg: dict,
                  game: int, turns: int) -> None:
-        """执行一个动作, 并按人的节奏等一会儿."""
+        """执行一个动作, 并按人的节奏等一会儿.
+
+        协议倒计时临近时(见 tuning.NET_TURN_CLOCK)把拟人延时压到
+        `NET_URGENT_DELAY`: 少一点"像人"总好过被雀魂托管接管 —— 托管会替我们
+        连吃带碰还乱打, 代价大得多. 这是**唯一**会压缩节拍的情形, 正常局面照旧.
+        """
+        urgent = _urgent_now(self)
+        if urgent:
+            left = getattr(self, "_urgent_left", None)
+            how = f"剩 {left:.1f}s" if isinstance(left, (int, float)) else "临期"
+            self.log_warning(f"  协议倒计时{how}，压缩节拍立即行动")
         if decision.action == ACTION_DISCARD:
-            delay = timing.discard_delay(self._rng)
+            delay = (tuning.NET_URGENT_DELAY if urgent
+                     else timing.discard_delay(self._rng))
             self.log_info(f"  想 {delay:.1f}s 后打 {decision.tile}"
                           f"（{decision.reason}）")
             self.sleep(delay)
@@ -1458,7 +1865,8 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             self.log_warning(f"  按钮 {decision.button} 没有框，跳过")
             return
 
-        delay = self._action_delay(decision)
+        delay = (tuning.NET_URGENT_DELAY if urgent
+                 else self._action_delay(decision))
         self.log_info(f"  想 {delay:.1f}s 后点 {decision.button}"
                       f"（{decision.reason}）")
         self.sleep(delay)
@@ -1491,8 +1899,14 @@ class PlayOneGameTask(CreateFriendsRoomTask):
 
         返回 False = 这一轮读数不可信, 主循环跳过本轮不出任何动作.
 
-        三个出口, 按保守程度排:
+        四个出口, 按保守程度排:
 
+        - 协议明确说这一手已经结束(`round_open is False`, 过场/和牌演出):
+          眼前这"手牌"是残影, 根本没有"活手牌的张数"可比 —— 既不闸也
+          绝不重同步(2026-10-18 19:51 局实锤: 门清立直荣和, 收牌动画连续
+          3 帧只读出 8 张, 旧逻辑把正确的"副露 0 组"记账重同步成 2 组.
+          记账是对的, 读数是错的). 协议没说话(None)或说还在打(True)时
+          照常闸 —— 纯视觉模式下这道闸仍然有效.
         - `missing_slots > 0`(漏认空档)或 `_pre_meld` 未结(副露过渡帧):
           不判 —— 张数本来就不可信/正在变, 交给既有守卫(决策层 suspect /
           稳健出牌 / 双帧确认), 不在这里抢戏.
@@ -1504,6 +1918,9 @@ class PlayOneGameTask(CreateFriendsRoomTask):
           一张不打. 反推只在张数本身合法(meld_count_of 有定义)且
           >= 4(防空行幻觉)时做, 推不出来的(6/9 张这类夹缝值)继续等.
         """
+        if _proto_round_open_of(self) is False:
+            self._count_mismatch_streak = 0
+            return True
         if hand.missing_slots or self._pre_meld is not None:
             return True
         expected = expected_concealed_counts(self._meld_count)
@@ -1518,8 +1935,10 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             f"这一轮读数不可信，不出牌", level="warning")
         if self._count_mismatch_streak == 1:
             # 只有事件的第一帧留证: 后续帧画面相同, 存了也是刷盘.
-            self._save_unknown_page(
-                frame, f"张数{hand.count}与副露{self._meld_count}组不符")
+            # 收局后不留证: 那时读数本来就是残影, 不是"感知坏了".
+            if _proto_round_open_of(self) is not False:
+                self._save_unknown_page(
+                    frame, f"张数{hand.count}与副露{self._meld_count}组不符")
         if self._count_mismatch_streak >= tuning.MELD_COUNT_RESYNC_FRAMES:
             derivable = None
             if 4 <= hand.count <= 14:
@@ -1539,13 +1958,15 @@ class PlayOneGameTask(CreateFriendsRoomTask):
     def _ensure_auto_toggles(self, cfg: dict, frame, has_yaku: bool) -> None:
         """把左上操作条的「和/(鸣)/(拔)」自动开关点亮(2026-10-07 用户提议).
 
-        自动和了 + 自动拔北恒开; 「鸣」开关按**本手手牌**动态决定
-        (2026-10-08 用户拍板): 有役牌对子(白/发/中/场风东)就不点「鸣」,
-        让碰的机会弹出来(配合 MELD_POLICY="peng"); 没有役对就点「鸣」
-        自动拒绝鸣牌. 注意「鸣」=**自动拒绝鸣牌**, 有役对时绝不能开,
-        否则雀魂会自动拒掉所有碰的机会(见 tuning.auto_toggles_on).
-        has_yaku 由调用方判定并做**两帧共识**(just_opened 那帧的 z 牌
-        单帧误读会造出幻影役对, 见主循环的说明).
+        自动和了 + 自动拔北恒开. 「鸣」= **自动拒绝鸣牌**(吃碰杠一整类):
+        **点着它雀魂就不画吃碰杠面板**, 决策层连"这一把要不要鸣"都没机会
+        回答, 所以默认**不点**(`tuning.AUTO_DECLINE_MELD=False`, 2026-10-17
+        真机拍板 —— 那一场协议给了 25 次机会、视觉一次没见到面板). 只有
+        `AUTO_DECLINE_MELD=True` 才回到老行为: 有役牌对子(白/发/中/场风东)
+        不点鸣让碰的机会弹出来, 没役对点鸣自动拒. 详见 tuning.auto_toggles_on.
+
+        has_yaku 只在 AUTO_DECLINE_MELD=True 时才有意义, 那时由调用方判定并做
+        **两帧共识**(just_opened 那帧的 z 牌单帧误读会造出幻影役对, 见主循环).
         开关状态靠颜色(开=亮绿 关=灰蓝, 见 vision.is_toggle_green 与
         tuning.AUTO_TOGGLE_ROWS 的实测数值), 幂等 —— 已开就不碰.
 
@@ -1567,12 +1988,19 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             x0, x1, y0, y1 = rows[name]
             return (int(x0 * w), int(y0 * h), int((x1 - x0) * w), int((y1 - y0) * h))
 
-        cut = rect("切")
-        if is_toggle_green(frame, cut):
-            self.log_warning("  自动开关:「切」(自摸切)开着, 会自动打出摸到的牌, 帮忙关闭")
-            self._click_toggle_row(cut, "切")
-            self.sleep(0.4)
-            frame = self.next_frame()
+        # 「必须关掉」的开关: 目前只有「切」(自摸切) —— 它开着会自动打出我们摸到
+        # 的牌. 「鸣」(自动拒绝鸣牌)不在这里: 用户 2026-10-17 明确"不需要主动关,
+        # 开局就是不点就行"(雀魂的自动开关每手本来就复位回关), 所以对「鸣」只做
+        # "不去点亮", 见 tuning.auto_toggles_on / auto_toggles_off.
+        must_off = [(name, rect(name)) for name in tuning.auto_toggles_off()
+                    if name in rows]
+        for name, px in must_off:
+            if is_toggle_green(frame, px):
+                self.log_warning(f"  自动开关:「{name}」开着"
+                                 f"(会替我们决定), 帮忙关闭")
+                self._click_toggle_row(px, name)
+                self.sleep(0.4)
+                frame = self.next_frame()
         pending = [(name, rect(name)) for name in toggles
                    if name in rows and not is_toggle_green(frame, rect(name))]
         if not pending:
@@ -1584,15 +2012,16 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         self.sleep(0.5)
         frame = self.next_frame()
         failed = [name for name, px in pending if not is_toggle_green(frame, px)]
-        # 「切」误点亮防护(2026-10-11 升级): 点回去之后必须复读确认, 关不掉
-        # 就再点(最多两轮); 意图开关没点亮的顺手补点. 全绿 + 「切」全灰才算
-        # 就绪, 否则不置 _toggles_ok, 下一手从头再来.
+        # 误点亮防护(2026-10-11 升级, 2026-10-17 扩到「鸣」): 点掉之后必须复读
+        # 确认, 关不掉就再点(最多两轮); 意图开关没点亮的顺手补点. 意图全绿 +
+        # 「必须关」全灰才算就绪, 否则不置 _toggles_ok, 下一手从头再来.
         for _ in range(2):
-            if not failed and not is_toggle_green(frame, cut):
+            still_on = [(n, px) for n, px in must_off if is_toggle_green(frame, px)]
+            if not failed and not still_on:
                 break
-            if is_toggle_green(frame, cut):
-                self.log_warning("  自动开关:「切」(自摸切)亮着, 点掉")
-                self._click_toggle_row(cut, "切")
+            for name, px in still_on:
+                self.log_warning(f"  自动开关:「{name}」亮着, 点掉")
+                self._click_toggle_row(px, name)
                 self.sleep(0.5)
             for name, px in pending:
                 if name in failed:
@@ -1603,20 +2032,22 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             frame = self.next_frame()
             failed = [name for name, px in pending
                       if not is_toggle_green(frame, px)]
-        cut_green = is_toggle_green(frame, cut)
-        if failed or cut_green:
+        left_on = [n for n, px in must_off if is_toggle_green(frame, px)]
+        if failed or left_on:
             msgs = []
             if failed:
                 msgs.append(f"没点亮: {failed}")
-            if cut_green:
-                msgs.append("「切」关不掉, 自动摸切会替你打牌（下一手再试）")
+            if left_on:
+                msgs.append(f"关不掉: {left_on}"
+                            f"（「切」会替你打牌; 「鸣」会让吃碰杠面板不出现）")
             self.log_warning(f"  自动开关{'; '.join(msgs)}"
                              f"（反复失败 = 点击没落在竖条字符上, "
                              f"请核对 tuning.AUTO_TOGGLE_ROWS 行位标定）")
         else:
             self._toggles_ok = True
             on = [n for n in toggles if n in rows]
-            note = "自动和了" + ("/不鸣牌" if "鸣" in on else "/可鸣牌")
+            note = "自动和了" + ("/不鸣牌" if "鸣" in on
+                                 else "/可鸣牌(面板会弹出来)")
             if "拔" in on:
                 note += "/自动拔北"
             self.log_info(f"  自动开关已就绪: {'/'.join(on)} （{note}）")
@@ -1640,9 +2071,14 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         self.move(px, py)
 
     def _action_delay(self, decision) -> float:
-        from src.mahjong.table import (ACTION_BABEI, ACTION_CONFIRM,
-                                       ACTION_MELD, ACTION_RIICHI,
-                                       ACTION_SKIP, ACTION_WIN)
+        from src.mahjong.table import (
+            ACTION_BABEI,
+            ACTION_CONFIRM,
+            ACTION_MELD,
+            ACTION_RIICHI,
+            ACTION_SKIP,
+            ACTION_WIN,
+        )
         if decision.action == ACTION_WIN:
             return timing.win_delay(self._rng)
         if decision.action == ACTION_RIICHI:
@@ -1652,6 +2088,18 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         if decision.action in (ACTION_SKIP, ACTION_CONFIRM):
             return timing.idle_delay(self._rng)
         return timing.idle_delay(self._rng)
+
+    def _prefer_non_aka_box(self, tile: str, hand, box):
+        """同牌种里有赤宝牌在场时, 出牌**避开画着红牌的那个槽**.
+
+        逻辑在模块级 `_prefer_non_aka_box_impl`(单测把 `_discard` 绑到假对象
+        上跑, 假对象没有这些属性 —— 拿不到就原样返回, 不猜).
+        """
+        grab = getattr(self, "_grab", None)
+        net = getattr(self, "_net", None)
+        if not callable(grab) or net is None:
+            return box
+        return _prefer_non_aka_box_impl(net, grab, tile, hand, box)
 
     def _discard(self, decision, hand, cfg: dict, game: int, turns: int) -> bool:
         """点手牌出牌, 并确认手牌真的少了一张.
@@ -1671,6 +2119,9 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         if box is None:
             self.log_warning(f"  第 {decision.index} 张牌没有框，跳过")
             return True                     # 没点, 不算"点了没反应"
+        prefer = getattr(self, "_prefer_non_aka_box", None)
+        if callable(prefer):                # 假对象上没有这个方法(见 impl 说明)
+            box = prefer(decision.tile, hand, box)
 
         before = hand.count
         point = self._random_point_in_box(
@@ -1731,7 +2182,8 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         返回"这次终于打出去了没有". 失败时把 `_discard_misses` 加一 ——
         连续失败就是"点了没反应"的唯一现场证据(见 tuning.DISCARD_MISS_LIMIT).
         """
-        index = pick_tile_index(hand.tiles, decision.tile, self._rng)
+        index = pick_tile_index(hand.tiles, decision.tile, self._rng,
+                                drawn_tile=getattr(self, "_drawn_tile", None))
         box = hand.box_of(index) if index is not None else None
         if box is None:
             box = hand.box_of(decision.index)
@@ -1775,10 +2227,6 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             self.log_info("YOLO 已预热")
         return self._vision
 
-    def _read_hand(self):
-        """抓一帧新手牌. 抓不到帧返回 None(调用方跳过这一轮的判断)."""
-        return self._read_hand_frame()[1]
-
     def _save_low_conf_frame(self, frame, hand) -> None:
         """护栏(2026-10-10): 读数里有 conf<LOW_CONF_SAVE_CONF 的槽位就留证帧.
 
@@ -1796,6 +2244,34 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         限额: 每局 LOW_CONF_SAVE_MAX_PER_GAME 张, 防止极端局面刷盘.
         """
         if frame is None or hand is None or not hand.boxes:
+            return
+        # 收局后静音: 这一手已经结束(协议 round_open=False), 画面是摊牌/顺位
+        # 面板, 读出来的 7~11 张碎片不是"低置信误识现场" —— 存了只是刷盘
+        # (2026-10-18 13:50:03 那张 frame_lowconf 就是结算残影).
+        if _proto_round_open_of(self) is False:
+            return
+        # 发牌/整理动画静音: 牌还没发齐(deal watch 没确认)或刚发齐的这几秒
+        # 里牌在滑动, 低置信是动画常态不是误识现场, 存帧纯刷盘(2026-10-17
+        # 16:48 局开局连存数张). 静音只影响存帧, 读数/投票照常.
+        deal = getattr(self, "_deal", None)
+        if deal is not None:
+            if not getattr(deal, "opened", False):
+                return
+            opened_at = float(getattr(deal, "opened_at", 0.0) or 0.0)
+            if opened_at and (time.time() - opened_at
+                              < tuning.LOWCONF_MUTE_AFTER_DEAL):
+                return
+        # 摸牌渐入动画静音(与 _draw_settle_pending 同一个窗, 见
+        # tuning.NET_DRAW_SETTLE): 万一某轮还是读到了(临期跳过等待等),
+        # 动画期的低置信也不留证 —— 它是动画常态不是误识现场(2026-10-17
+        # 4 张 lowconf 帧全是它, 用户逐帧判定).
+        try:
+            drawn_secs = (self._net.seconds_since_self_draw()
+                          if self._net is not None else None)
+        except Exception:  # noqa: BLE001 - 网络层永不拖垮主循环
+            drawn_secs = None
+        if (drawn_secs is not None
+                and drawn_secs < tuning.NET_DRAW_SETTLE):
             return
         low = low_confidence(hand.boxes, tuning.LOW_CONF_SAVE_CONF)
         if not low:
@@ -1823,7 +2299,7 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         """抓一帧并读手牌, 返回 `(frame, HandReading)`. 抓不到帧是 `(None, None)`.
 
         调用方需要**判定当帧**时用它(留证帧必须是决策/判定用的那一张, 见
-        `_record_turn`); 只要读数的话用 `_read_hand` 就够了.
+        `_record_turn`); 主循环的读手牌走 `_read_hand(vision, frame, cfg)`.
         """
         frame = self._grab()
         if frame is None:
@@ -1941,7 +2417,9 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             self.log_warning(f"写记录失败: {e}")
 
     def _record_turn(self, game: int, turns: int, hand, buttons,
-                     decision, frame=None) -> None:
+                     decision, frame=None, net: str = "",
+                     ev: dict | None = None,
+                     trust: str = "") -> None:
         """记一轮, 并把**决策当帧**存到 data/debug/.
 
         `frame` 必须是这一轮真正读过的**那一帧**, 不能省。原来这里不接 frame,
@@ -1949,6 +2427,10 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         `frame_g1_tN.png` 与第 N 轮的决策**不是同一帧**。它不一定差很远, 但在
         "手牌正在逐张发出来"的那几秒里能差 5 张牌, 2026-10-07 排查时直接被带偏
         (拿留证帧重跑模型, 结果和日志里的 hand 对不上, 白查了一轮)。
+
+        `ev` 是影子档的出牌 EV 估值(见 _ev_shadow): 同一行里既有我们实际打的
+        那张, 也有引擎排的前三名, 所以"我们打的那张排第几、少多少期望"事后
+        直接从 jsonl 算得出来, 不用再回放协议 spool.
         """
         self._record({
             "event": "turn", "game": game, "turn": turns,
@@ -1970,9 +2452,19 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             "tile": decision.tile,
             "index": decision.index,
             "reason": decision.reason,
+            # 网络读牌对账摘要(影子/接管档都有; 关闭档为空串). 事后能拿
+            # 它逐轮对比"协议看到的 vs 视觉读到的", 判断接管档能不能开.
+            "net": net,
+            # 信任档三态(trusted/mismatch/off). 没有它, "那轮双帧为什么没跳过"
+            # 只能靠猜 —— 2026-10-17 16:21 首个出牌轮多花 0.5s 走了双帧, jsonl
+            # 里却查不到当时 trust 是什么.
+            "trust": trust or None,
+            # 出牌 EV 估值(不在"该我打牌"的时刻为 null).
+            "ev": ev,
         })
-        if self._cfg.get("save_frames"):
-            self._save_frame(f"g{game}_t{turns}", frame)
+        # 每轮存帧(save_frames)已删(2026-10-17): 正常帧没有诊断价值, 留证
+        # 只剩 lowconf/gate/待标注 三类自动帧. 决策当帧的完整性由上面那行
+        # jsonl 里的 hand_boxes 保证.
 
     def _save_frame(self, tag: str, frame=None) -> None:
         """存一帧留证. `frame` 给了就用它(决策当帧), 没给才去抓新的."""

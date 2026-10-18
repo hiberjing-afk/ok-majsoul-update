@@ -241,7 +241,7 @@ def spec_by_combination(players: str, length: str) -> RoomSpec:
     try:
         return _COMBINATION_TABLE[(players, length)]
     except KeyError:
-        valid = "、".join(f"{p}{l}" for p, l in available_combinations())
+        valid = "、".join(f"{p}{ln}" for p, ln in available_combinations())
         raise KeyError(
             f"没有「{players} + {length}」这个组合（可选: {valid}）"
         ) from None

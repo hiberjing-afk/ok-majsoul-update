@@ -4,7 +4,6 @@
 不要在仓库里依赖 `ok_tasks/` 目录扫描(那个目录留给用户自定义任务, 且不进版本库).
 """
 
-import os
 
 from src import ok_compat
 

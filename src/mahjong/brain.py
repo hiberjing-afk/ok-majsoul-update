@@ -147,6 +147,15 @@ def _all_kinds(player_count: int) -> tuple[str, ...]:
             + tuple(f"{n}z" for n in range(1, 8)))
 
 
+def all_kinds(player_count: int = 3) -> tuple[str, ...]:
+    """全部牌种的公开入口(见 _all_kinds).
+
+    出牌牌效与 EV 估值都要按牌种枚举进张, 问的是同一个问题"这个人数规则下
+    有哪些牌" —— 与其让别的模块去碰私有名, 不如开一个正门.
+    """
+    return _all_kinds(player_count)
+
+
 def _extension_ukeire(tiles13: list[str], meld_count: int,
                       player_count: int) -> int:
     """二阶进张: 13 张的手再摸一张(每种牌各试一次)后, 最好出牌的进张数之和.
@@ -275,11 +284,21 @@ def choose_discard(
 def rank_discards(
     tiles: list[str], meld_count: int = 0, *, player_count: int = 3,
     keep_kinds: frozenset[str] = frozenset(),
+    visible: list[int] | None = None,
 ) -> list[DiscardPlan]:
-    """按牌效从好到坏列出所有可打的牌(不带随机性). 用于调试与单测."""
+    """按牌效从好到坏列出所有可打的牌(不带随机性). 用于调试与单测.
+
+    `visible` 是"手牌之外看得见的牌"的 34 类计数(牌河 + 全部副露 + 已翻
+    指示牌, 见 ev_eval.visible_from). 给了它, 进张就按**真实剩张**算: 牌河里
+    已经躺了三张 5p, 再指望摸 5p 就是自欺. 不给(None) 就是老口径 —— 每种牌
+    恒按 4 张算, 进张系统性虚高.
+
+    **不要把 14 张以外的张数档传进来**: `discard_evaluation` 只认 post-draw
+    手(14/11/8/5/2 张), 13 张档它会直接抛 ValueError.
+    """
     options = _honors_first(
         discard_evaluation(_hand_of(tiles, meld_count),
-                           player_count=player_count))
+                           player_count=player_count, visible=visible))
     options = _extension_tiebreak(options, tiles, meld_count, player_count,
                                   keep_kinds=keep_kinds)
     return [

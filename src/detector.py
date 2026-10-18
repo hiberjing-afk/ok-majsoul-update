@@ -24,8 +24,14 @@ from typing import Sequence
 
 import numpy as np
 
-from src.detection import (Detection, drop_meld_tiles, group_by_label,
-                           missing_slots, read_row, region_pixels)
+from src.detection import (
+    Detection,
+    drop_meld_tiles,
+    group_by_label,
+    missing_slots,
+    read_row,
+    region_pixels,
+)
 from src.instrumentation import bench
 from src.paths import TILE_MODEL, UI_MODEL
 
@@ -122,7 +128,7 @@ UI_IMGSZ = 640
 #   - 每槽只留最优(倍率 1.00~1.05 的等间距, 分槽很干净);
 #   - 低于 MIN_TILE_CONF 的槽位不算"认准", 会走稳健出牌;
 #   - 张数仍然要过 is_plausible_concealed + missing_slots 两道关;
-#   - 多帧投票(vote_labels)还能纠正一部分标签.
+#   - 协议对账(net.assist.reconcile_hand)会把标签整体换成协议真值.
 # 也就是说: 低置信框只影响"有几张牌"这个几何事实, 不会直接被当成确定标签用.
 TILE_CONF = 0.15
 # UI 模型跑整帧. 按钮比手牌大得多, 640 已经够.
@@ -179,9 +185,13 @@ class HandReading:
         return None
 
 
-def with_voted_labels(hand: HandReading,
-                      labels: Sequence[str]) -> HandReading:
-    """把多帧投票后的**标签**套回 hand, 其余字段**原样保留**.
+def with_labels(hand: HandReading,
+                labels: Sequence[str]) -> HandReading:
+    """把对账后的**标签**套回 hand, 其余字段**原样保留**.
+
+    用途: 协议对账(net.assist.reconcile_hand)把视觉读出的标签整体换成协议
+    真值时, 坐标/置信度/missing_slots 都必须是当帧事实, 只有"这张牌叫什么"
+    换成协议给的.
 
     为什么用 `dataclasses.replace` 而不是重新构造一个 HandReading:
     这个函数原来是逐字段重新构造的, 于是新加的 `missing_slots` 被悄悄丢成
@@ -196,7 +206,7 @@ def with_voted_labels(hand: HandReading,
     不是当帧实测, 事后拿留证帧重跑模型根本对不上(实测 t164). 现在被改过标签
     的那个框, 置信度仍然是它**当帧**的观测值: 它低, 就照样进 `low_confidence`
     走稳健出牌 —— 因为"这一槽当帧没认准"本身就是真话. 也正因为几何不动,
-    这里绝不拿 voted 重算间距(否则 missing_slots 又变成一个假数).
+    这里绝不拿新标签重算间距(否则 missing_slots 又变成一个假数).
     """
     boxes = [replace(b, label=lab) for b, lab in zip(hand.boxes, labels)]
     return replace(hand, tiles=list(labels), boxes=boxes)

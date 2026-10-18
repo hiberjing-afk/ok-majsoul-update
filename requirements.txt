@@ -1,4 +1,17 @@
-ok-script[ocr,qt]>=2.0.8
+# ok-script 是**行为相关**的框架依赖: 模板匹配、坐标缩放、页面特征打分全在它
+# 里面, 我们的所有识别阈值(0.88/0.80/0.15)都是对着某一版实测出来的.
+# 所以这里**钉死版本**, 不用 >= —— 升框架必须当成一次改动来验证(全量测试 +
+# 实跑一场), 不能靠 pip 悄悄升.
+ok-script[ocr,qt]==2.0.8
+# **PySide6 必须 < 6.12**(2026-10-18 实测): 6.12 改了
+# `QStyleSheetStyle::subControlRect(SC_SpinBoxEditField)` 对 QSS padding 的算法,
+# 而 qfluentwidgets 1.11.3(ok-script 2.0.8 装的就是它)的 `SpinBox` 靠
+# `padding: 0 80px 0 10px` 给右侧内联加减按钮留位 —— 两边一叠加, 六点十二把
+# 输入区算成 **1px 宽**: 界面上的整数配置框(max_games)于是"不显示数字、
+# 也点不进去改"。6.11.2 下同一份代码算出 88px, 正常。
+# 这条约束没有上层帮忙兜: ok-script 只要 `PySide6-Essentials>=6.7.0`,
+# pyside6-fluent-widgets 只要 `PySide6`, 谁都不设上限, 所以必须我们自己钉。
+PySide6<6.12
 opencv-python>=4.10.0
 numpy>=1.26.0
 Pillow>=10.0.0
@@ -7,9 +20,35 @@ psutil>=5.9.0
 # 牌效 / 向听 / 听牌计算引擎. 零外部依赖, MIT, Python >= 3.10.
 # 实测 0.14.0: 三人麻将传 player_count=3 会自动去掉 2m-8m(只剩 27 种牌).
 jansou>=0.14.0
+# 可选的原生加速(只发 Windows wheel, 无 sdist): 把 jansou 的牌效热路径换成
+# 查表实现. 2026-10-17 实测 discard_outlooks 不带估值 p50 11.70ms -> 1.47ms,
+# 带估值 p50 16.2ms -> 2.14ms —— **快一个数量级**.
+#
+# 故意**不写成硬依赖**: 它是可选加速, 装不上只该降级不该让整个安装失败
+# (jansou.analysis._native.build() 拿不到就返回 (None, None), 自动走纯 Python)。
+# 想开的话:
+#     .runtime\python\python.exe -m pip install --target .runtime\site-packages jansou-native>=0.1.0
+# 装了之后必须跑一次一致性验收(它就是"原生解算镜像了纯 Python 扫描顺序"这句
+# 话的可执行断言; 算歪了不抛异常, 只是决策慢慢变得不对):
+#     .runtime\python\python.exe tools\parity_ev.py
+# 注意: 没装的环境跑测试会多 1 个 skip(那条一致性用例没有可比对象), 属预期.
+# jansou-native>=0.1.0
 # 对局内感知(YOLO, ONNX). v1.1 起推理走 onnxruntime-directml(DirectML 走
 # DirectX 12, N/A/I 卡都能加速), **不再依赖 torch/ultralytics** -- 依赖体积
 # 从 ~3GB 降到 ~300MB. 与 torch 后端的一致性验收见 tools/parity_check.py
 # (逐框一致) 与 tools/parity_synth.py (合成手牌 59/60 手读数完全一致、
 # conf 门槛零翻转). 权重(models/*.onnx)不进版本库, 随 Release 包分发.
 onnxruntime-directml>=1.20.0
+# liqi 协议 protobuf 解析(src/net). vendored pb2(src/net/proto/liqi_pb2.py)
+# 由 protoc ~4.x 生成, 运行时要 >=4.25 的运行时; 实测 7.36.2 兼容.
+# 注意 protobuf 7.x 的两个坑(已在 src/net/liqi.py docstring 记录):
+# 1) Message.FromString() 不保证原地修改, 必须用 ParseFromString();
+# 2) FieldDescriptor.label/.cpp_type 被移除, 判 repeated 用 is_repeated.
+protobuf>=4.25
+# 网络读牌的抓包入口(mitmdump + liqi addon, tools/mitm/). 任务启动时会自动
+# 拉起它(src/net/capture.py, 见 tuning.CAPTURE_AUTO), 所以要在依赖里 ——
+# 缺了只是自动抓包起不来(降级纯视觉), 但那样"网络读牌"就等于没开.
+# 版本锁 12.x: addon 的 websocket_message 钩子按 mitmproxy >= 11 的
+# HTTPFlow 形态写(见 tools/mitm/liqi_addon.py 与 docs/NET_CAPTURE.md §四.1),
+# 大版本 drift 会重演"每帧 AttributeError -> spool 永远空文件"那个坑.
+mitmproxy>=12,<13

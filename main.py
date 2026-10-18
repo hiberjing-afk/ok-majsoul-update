@@ -166,7 +166,7 @@ def check_update_quietly() -> None:
         if release:
             print(f"[UPDATE] 发现新版本 {release.tag}（当前 {APP_VERSION}）")
             print(f"[UPDATE] 下载页: https://github.com/{UPDATE_REPO}/releases/latest")
-            print("[UPDATE] 可运行 `.venv\\Scripts\\python -m src.update --apply` 自动更新")
+            print("[UPDATE] 可运行 `.runtime\\python\\python -m src.update --apply` 自动更新")
     except Exception:
         pass  # 更新检查永不阻塞启动
 

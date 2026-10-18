@@ -73,13 +73,11 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
-import numpy as np
 import win32api
 import win32con
 import win32gui
@@ -93,19 +91,26 @@ from src.annotations import (
     frame_box,
     load_annotations,
     missing_categories,
-    split_category,
 )
 from src.imageio import imread_unicode, imwrite_unicode
 from src.instrumentation import bench
 from src.paths import COCO_ANNOTATIONS, DEBUG_ARTIFACTS_DIR, TEMPLATES_DIR
-from src.rooms import (LENGTH_OPTIONS, PLAYER_OPTIONS, LOGIN_ENTRY, RoomSpec,
-                       Step, build_room_flow, ready_marker,
-                       required_categories, spec_by_combination, spec_by_key)
+from src.rooms import (
+    LENGTH_OPTIONS,
+    LOGIN_ENTRY,
+    PLAYER_OPTIONS,
+    RoomSpec,
+    Step,
+    build_room_flow,
+    ready_marker,
+    required_categories,
+    spec_by_combination,
+    spec_by_key,
+)
 from src.tasks import tuning
 from src.vision import is_selected_orange
 from src.widget_types import mark_unrenderable_hidden
 from src.window import clamp_into_screen
-
 
 # 待标注截图的 hint 会拼进文件名, 而 hint 里可能带决策 reason(含空格 / 括号),
 # Windows 文件名不允许的字符在这里清掉.
@@ -269,16 +274,23 @@ class CreateFriendsRoomTask(BaseTask):
         t0 = time.time()
         try:
             self._ensure_window_ready()
-            self._enter_lobby(cfg)
-            self._run_flow(cfg)
-            # 段位场没有准备页: 点完"四人东"就自动匹配, ready_marker
-            # (对局开始页/胜负)由打牌任务的匹配等待去认, 这里跳过自检
-            # -- 否则它会拿 PAGE_WAIT_TIMEOUT(秒级)去等分钟级的匹配.
-            if not self._spec.ranked:
-                self._verify_ready_page(cfg)
-            # 钩子: 打牌任务在这里接着点"开始"并打完一局. 建房任务什么都不做.
-            self._after_room_ready(cfg)
-            self.log_info(f"创建房间任务完成，用时 {time.time() - t0:.1f}s")
+            # 钩子: 进大厅/点房间**之前**(窗口就绪后). 打牌任务在这里起
+            # 抓包 —— 段位场点完"四人东"就自动匹配, 分钟级的匹配期不该
+            # 在抓包就位前裸奔(2026-10-17 用户拍板).
+            self._before_room_flow(cfg)
+            try:
+                self._enter_lobby(cfg)
+                self._run_flow(cfg)
+                # 段位场没有准备页: 点完"四人东"就自动匹配, ready_marker
+                # (对局开始页/胜负)由打牌任务的匹配等待去认, 这里跳过自检
+                # -- 否则它会拿 PAGE_WAIT_TIMEOUT(秒级)去等分钟级的匹配.
+                if not self._spec.ranked:
+                    self._verify_ready_page(cfg)
+                # 钩子: 打牌任务在这里接着点"开始"并打完一局. 建房任务什么都不做.
+                self._after_room_ready(cfg)
+                self.log_info(f"创建房间任务完成，用时 {time.time() - t0:.1f}s")
+            finally:
+                self._after_room_flow()
         except TaskStopped as e:
             # 用户主动喊停, 不是失败. 不记 error 也不往上抛, 否则日志里会留一条
             # 红色的"任务失败", 让人误以为出了故障.
@@ -515,6 +527,12 @@ class CreateFriendsRoomTask(BaseTask):
 
     def _after_room_ready(self, cfg: dict) -> None:
         """房间就绪后的钩子. 基类什么都不做, 打牌任务(子类)在这里开局."""
+
+    def _before_room_flow(self, cfg: dict) -> None:
+        """房间流程(进大厅/点房间)开始**之前**的钩子. 基类什么都不做."""
+
+    def _after_room_flow(self) -> None:
+        """房间流程结束(无论正常/异常/喊停)的清理钩子. 基类什么都不做."""
 
     def _default_config(self) -> dict:
         """默认配置. 子类(打牌任务)覆写这个来加自己的参数."""
@@ -1117,7 +1135,10 @@ class CreateFriendsRoomTask(BaseTask):
         if not self._annotations:
             self.log_warning(
                 f"还没有任何标注: {coco_path} 不存在或为空。"
-                f"请在游戏界面里用「模板」页签截图并框区域。")
+                f"如果是**全新安装**, 大概率不是没标注, 而是这个安装包里"
+                f"没有 ok_templates/(页面模板) —— 或首次运行的资源下载因"
+                f"没有授权令牌失败了。请向作者索取完整的主程序包"
+                f" ok-majsoul-<版本>.zip(内含模板), 而不是自己去框标注。")
             return
         for category in sorted(self._annotations):
             annotation = self._annotations[category]

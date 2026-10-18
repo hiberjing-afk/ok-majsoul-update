@@ -500,68 +500,14 @@ def low_confidence(boxes: Sequence[Detection],
     打 3z(向听1 进张21). 日志里 25 轮出牌回放, 22 轮与复算完全一致,
     3 轮差异都能被"次优/随机"档位解释 -- **决策层可复现, 错的是输入**.
 
-    与多帧投票互补: 投票只在"多帧不一致"时改变结果, 而这里认错的那张
-    牌可能**连续十几帧都稳定地认成同一个错类别**(实测位置 4 有 18/19/17
-    帧的连续低置信段), 所以投票救不了, 只能把低置信槽位交给决策层的
-    稳健出牌(枚举可能取值, 挑一张怎么认都不踩坑的).
+    与协议对账互补: 对账(net.assist.reconcile_hand)在协议可用时把标签整体
+    换成协议真值; 而这里认错的那张牌可能**连续十几帧都稳定地认成同一个错
+    类别**(实测位置 4 有 18/19/17 帧的连续低置信段), 协议张数对不上或桥
+    不可用时对账不出手, 只能把低置信槽位交给决策层的稳健出牌(枚举可能
+    取值, 挑一张怎么认都不踩坑的).
 
     早先的方案是"低置信就整轮不出牌, 等下一帧认准", 已经被数据证伪并删掉,
     原因见上面 MIN_TILE_CONF 那段注释(等不回来 + 73% 时间空等 + 误识牌从不被
     直接点). 这里的定位是**筛出不可信的槽位**喂给稳健出牌, 不是拦住这一轮.
     """
     return [i for i, b in enumerate(boxes) if b.conf < threshold]
-
-
-# ---------------------------------------------------------------- 多帧投票
-
-
-def vote_labels(frames: Sequence[Sequence[Detection]],
-                min_conf: float = 0.0) -> list[str] | None:
-    """对同一个槽位做多帧多数表决, 压掉单帧的低置信度误识别.
-
-    **为什么需要(2026-10-06 实跑发现)**: 牌面模型对某些牌型(比如被选中
-    抬起, 或者被立直栏的牌挤住的那张)置信度会掉到 0.6~0.7, 同一张牌在
-    连续帧里会在两个类别之间来回跳. 实测 index=4 的位置跳变率 2.2%,
-    是全手牌里最高的(其余位置多在 0.3%)-- 于是系统会认真算出一张
-    "牌效最优但根本不是那张牌"的牌去打, 实跑里连续 5 轮点同一张牌
-    都打不出去(手牌数一直是 14).
-
-    为什么不靠调高 TILE_CONF 解决: 实测 1244 个框里真牌最低 0.433,
-    而0.40~0.75 这一档里**既有真牌也有误识**, 单纯抬高阈值会把真牌丢掉,
-    丢掉一张牌的危害比认错更严重(张数直接不对, 整轮判成"认漏了").
-    投票是只在"低置信度"时才出手的补丁, 不动主阈值.
-
-    frames 是同一帧位置的多张截图各自跑完 read_row 的结果(从左到右).
-    返回值每槽**一个类别名**, 取该槽票数最多的类别; 票数平手时取整体置信度
-    最高的那个框的类别, 也就是"没有任何异议就照用".
-
-    **只返回标签, 不返回框**(2026-10-07 改): 原来返回"该类别里置信度最高的
-    那个框", 而那个框**可能来自好几帧之前**. 于是 jsonl 里记的 `hand_conf` /
-    `hand_boxes` 根本不是当前帧的测量值 —— 拿留证帧重跑模型对不上(实测 t164
-    记录写 8s 置信 0.43, 重跑却是 5m 0.53), 日志还会先报 `8s->5m` 再报
-    `5m->8s` 自己打自己, 事后复盘直接被带偏. 几何和置信度是**当前帧**的
-    测量事实, 投票只该动"这张牌是什么"这一件事.
-    """
-    if not frames:
-        return None
-    usable = [f for f in frames if f]
-    if not usable:
-        return None
-
-    width = min(len(f) for f in usable)
-    if width == 0:
-        return None
-
-    out: list[str] = []
-    for i in range(width):
-        column = [f[i] for f in usable if len(f) > i
-                  and f[i].conf >= min_conf] or [f[i] for f in usable
-                                                if len(f) > i]
-        if not column:
-            return None
-        tally: dict[str, list[Detection]] = {}
-        for box in column:
-            tally.setdefault(box.label, []).append(box)
-        out.append(max(tally, key=lambda lab: (len(tally[lab]),
-                                               max(b.conf for b in tally[lab]))))
-    return out

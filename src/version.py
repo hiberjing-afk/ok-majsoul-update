@@ -6,7 +6,7 @@ GitHub 仓库（owner/repo 形式），否则启动时跳过更新检查。
 
 from __future__ import annotations
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "2.0.0"
 
 # GitHub 仓库（owner/repo）。空字符串 = 未发布状态，跳过更新检查。
 UPDATE_REPO = "hiberjing-afk/ok-majsoul"

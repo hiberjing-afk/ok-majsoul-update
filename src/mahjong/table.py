@@ -61,8 +61,7 @@ import random
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from src.mahjong.brain import (choose_discard, is_tenpai_hand, rank_discards,
-                               robust_discard)
+from src.mahjong.brain import choose_discard, is_tenpai_hand, rank_discards, robust_discard
 from src.mahjong.tiles import out_of_play_indices
 
 # ---- 动作 ----
@@ -85,6 +84,11 @@ BUTTON_CHI = "chi"                  # 吃可能弹组合选择条(没建模), �
 BUTTON_MELD = (BUTTON_PENG, BUTTON_CHI, BUTTON_GANG)
 BUTTON_SKIP = "tiaoguo"
 BUTTON_CONFIRM = ("confirm", "liuju")
+
+#: 协议的鸣牌种类 -> 要点的按钮名. 大明杠和暗杠/加杠共用「杠」这一个按钮
+#: (雀魂按当前机会决定点击语义), 所以 minggang 对应 BUTTON_GANG.
+KIND_TO_BUTTON = {"chi": BUTTON_CHI, "peng": BUTTON_PENG,
+                  "minggang": BUTTON_GANG}
 
 # 认得出来但先不动的按钮: match 是大厅的匹配(不该出现在对局里),
 # silver 和 3p-east 语义还没确认 -- 只记进日志, 不点.
@@ -353,6 +357,9 @@ class DealWatch:
     grace_until: float = 0.0
     #: 这一手的发牌已经确认过(>=13 张连续两帧 / 宽限兜底).
     opened: bool = False
+    #: 这一手的发牌**刚确认齐**的时刻(see() 里记录). 发牌后的整理动画期间
+    #: 牌在滑动, 低置信存帧按它静音(见 tuning.LOWCONF_MUTE_AFTER_DEAL).
+    opened_at: float = 0.0
     #: 这一帧手牌区里读得出可信的手牌(用来抓"从有到无"的边沿).
     seen_hand: bool = False
     #: 我们刚和了, 正在等摊牌/结算过完. 粘到下一次手牌区清空.
@@ -367,7 +374,7 @@ class DealWatch:
     pending_rearm: bool = False
 
     def see(self, count: int, missing_slots: int, now: float,
-            melded: bool = False) -> DealState:
+            melded: bool = False, round_open: bool | None = None) -> DealState:
         """喂一帧手牌读数, 返回这一帧能不能按正常逻辑打.
 
         melded: 这一手里我们自己鸣过牌(暗杠实锤过). 暗杠的 4 张牌**竖着**
@@ -376,6 +383,15 @@ class DealWatch:
         20:47 局实锤: 点完暗杠后 11+6=17 被当成摊牌 -> 闸门重臂 -> 杠后的
         手牌永远到不了 13 张 -> 死循环). 自己回合里摊牌不可能出现
         (结算画面没有吃碰杠按钮), 所以 melded=True 时跳过该判据.
+
+        round_open: 协议说"这一手还在打吗"(NetAssist.round_open; 不可用时
+        None). **清空边沿的协议否决**(2026-10-17 东二局实锤): 点完吃/碰的
+        滑入动画帧手牌可能只读出 1 张(< MIN_CONCEALED), 视觉上与"上一手
+        结束了"一模一样, 于是闸门在**一手打中间**被重臂 —— hand_end 误记、
+        副露记账清零、之后 25s 宽限期里闸门不开, 8 张手牌一张不出. 协议说
+        round_open=True 时, "手牌区空了"必然是动画帧不是收局(收局必有
+        Hule/NoTile/LiuJu 事件先到), 直接跳过重臂; None(抓包没开/断了)时
+        回退纯视觉判断(老行为, 误重臂也会在宽限兜底后恢复).
         """
         # force_rearm 是**一次性信号**: 点掉一手结束的「(N)确认」后画面可能
         # 直接切到下一手发牌, "手牌区清空"的边沿根本不出现(2026-10-08 实跑:
@@ -394,6 +410,14 @@ class DealWatch:
         if count + missing_slots >= 16 and not melded:
             count = 0
         if count < MIN_CONCEALED:
+            # 协议否决(见 docstring): 这一手协议说还在打, "空"必然是鸣牌
+            # 滑入动画之类的过渡帧, 不是收局 —— 状态一律不动(尤其不能动
+            # settling: 协议的 Hule 事件可能比摊牌动画晚到, 不能拿旧协议
+            # 值盖掉自己点过和了的事实), 闸门保持原样. force_rearm 是
+            # 显式信号, 优先级高于协议, 不能被这里吞掉.
+            if (round_open is True and not self.settling
+                    and not self.pending_rearm):
+                return DealState(done=self.opened)
             # 手牌区空着. 有两种情况, 处理一样: 上一手已经结束了(和了摊牌 /
             # 结算页 / 下一手还没发牌), 或者这一手还没开始.
             was = self.seen_hand or self.settling or force
@@ -421,6 +445,10 @@ class DealWatch:
                               grace_over=now >= self.grace_until)
         just = opened and not self.opened
         self.opened = opened
+        if just:
+            # 这一手"发齐"的时刻. 发牌确认后雀魂还会跑 ~1s 的整理动画(牌在
+            # 滑动), 那段低置信是常态不是现场 —— 低置信存帧按它静音.
+            self.opened_at = now
         return DealState(done=opened, just_opened=just, rearmed=force)
 
     def force_rearm(self, now: float) -> None:
@@ -539,8 +567,13 @@ def conf_of(buttons: Mapping[str, object], name: str) -> float:
 
 def pick_tile_index(tiles: list[str], tile: str,
                     rng: random.Random | None = None,
-                    allowed_indices: list[int] | None = None) -> int | None:
+                    allowed_indices: list[int] | None = None,
+                    drawn_tile: str | None = None) -> int | None:
     """在手牌里找这张牌的位置; **刚摸的那张**(末位)匹配时优先打它.
+
+    `drawn_tile` 是协议给的"刚摸到的那一张"(带赤记号: 三麻是 "0p"/"0s"),
+    只在这一手真的握着赤 5 时才起作用 —— 见下面"保留赤 5"那段. 拿不到
+    协议读数(None)时整段跳过, 行为与从前完全一致.
 
     **为什么优先摸牌位**(2026-10-10, 8筒误读局): 旧行为是打最左那张 ——
     手里有重复牌时会点进顺子中间, 视觉上"拆顺"(两张 8p 等价无损, 但用户
@@ -555,6 +588,17 @@ def pick_tile_index(tiles: list[str], tile: str,
     allowed_indices 非None 时只在这些下标里找(立直选牌态): 同一种牌可能
     既有高亮实例又有变暗实例, 必须确保点下去的那张是**高亮**的那张;
     摸牌位优先同样只在允许集合内生效.
+
+    **保留赤 5**(2026-10-18 用户拍板, 只做平局裁决): 视觉是 34 类, 认不出
+    赤(屏幕上手牌按花色点数排序, 赤 5 摆在普通 5 **左边**, 唯一例外是刚
+    摸到的那张, 它永远在最右边的独立槽). 于是同种牌有多个槽位时:
+        刚摸的正是赤 5 -> 最右那张才是赤 -> 打左边那张;
+        否则          -> 最左那张是赤   -> 打右边那张.
+    哪一种都还是"打一张 5p", 服务端看到的完全一致, 只有赤留不留的差别.
+
+    这条排在摸牌位优先**之前**: 刚摸到赤 5 时摸切会直接把它切掉, 那正是
+    要避免的. 拿不到 `drawn_tile` 时按老规矩打, 不猜 —— 白送一翻可以接受,
+    打错牌种不行.
     """
     positions = [i for i, t in enumerate(tiles) if t == tile]
     if allowed_indices is not None:
@@ -562,9 +606,56 @@ def pick_tile_index(tiles: list[str], tile: str,
         positions = [i for i in positions if i in allow]
     if not positions:
         return None
+    if len(positions) > 1 and drawn_tile is not None:
+        if drawn_tile == "0" + tile[1]:
+            return positions[0]       # 最右是刚摸到的赤 -> 打左边那张
+        return positions[-1]          # 最左是赤 -> 打右边那张
     if len(tiles) % 3 == 2 and positions[-1] == len(tiles) - 1:
         return positions[-1]      # 刚摸的那张就是它 -> 直接打摸到的牌
     return positions[0]
+
+
+def ev_tile_of(row) -> str | None:
+    """EV 候选里那一张牌的名字. 接受 `EvDiscard` 对象或裸字符串.
+
+    只 duck-typing 取 `.tile` 而不 import `ev_eval` —— 决策层要能在**没有
+    jansou** 的环境里被单独测(整个 tests/TestTable.py 就是这么跑的).
+    """
+    if isinstance(row, str):
+        return row
+    tile = getattr(row, "tile", None)
+    return tile if isinstance(tile, str) else None
+
+
+def pick_by_ev_rank(tiles: list[str], ev_rank: Sequence | None,
+                    allowed_tiles: set[str] | None = None):
+    """按 EV 排序(最优在前)挑**第一张落地得了的牌**, 返回那个候选(或 None).
+
+    只做落地过滤, 不重新排序(排序是引擎的事):
+    - 候选不在这一帧认出的手牌里 -> 跳过(协议读数与视觉读数不可能逐张重合);
+    - 给了 allowed_tiles(立直选牌态的高亮集合)就只在这个集合里挑.
+    全都落不了地时返回 None, 调用方回退到牌效 —— **宁可回退, 不硬打**.
+    """
+    have = set(tiles)
+    for row in ev_rank or ():
+        tile = ev_tile_of(row)
+        if not tile or tile not in have:
+            continue
+        if allowed_tiles is not None and tile not in allowed_tiles:
+            continue
+        return row
+    return None
+
+
+def ev_row_note(row) -> str:
+    """EV 候选取一截可读说明(填进 reason). 拿不到就空串."""
+    summary = getattr(row, "summary", None)
+    if callable(summary):
+        try:
+            return f"（{summary()}）"
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
 
 
 def _button_conf(buttons: Mapping[str, object], name: str) -> float:
@@ -651,6 +742,42 @@ def action_confirmed(first: TurnDecision, second: TurnDecision,
     return True, "两帧一致"
 
 
+#: 暗杠/加杠的"形中性"半径. 与要杠的牌相距这么多以内的同花色牌, 都可能
+#: 和它组成顺子: 7 的 ±2 正好覆盖 567 / 678 / 789 三种含 7 的顺子.
+_KAN_NEIGHBOR_REACH = 2
+
+
+def kan_keeps_shape(tile: str, tiles: Sequence[str]) -> bool:
+    """杠掉这张牌会不会拆散手里的搭子.
+
+    照抄 jansou 的 `_shape_neutral`(game/agents.py, 私有) 的判据, 不 import
+    它 —— 那个模块会把 game 子系统(action/event/flow)整个拖进来, 而本项目
+    只依赖 analysis 与 core 两层. 三麻只有 1m/9m, 半径判定照样成立(1m 的
+    邻域里只可能有 9m, |9-1|=8 > 2, 恒为中性, 等价于"1m 不成顺").
+
+    字牌恒为 True: 字牌组不成顺子, 杠掉它拆不了任何搭子.
+
+    `tiles` 里那几张要杠的牌自己会被跳过 —— 否则 4 张 7m 会自己判自己
+    "形不中性", 暗杠永远做不成.
+    """
+    if not tile or len(tile) != 2 or tile[1] == "z":
+        return True
+    suit = tile[1]
+    rank = 5 if tile[0] == "0" else int(tile[0])   # 赤 5 折叠
+    for other in tiles:
+        if len(other) != 2 or other[1] != suit:
+            continue
+        other_rank = 5 if other[0] == "0" else int(other[0])
+        # 按**折叠后的点数**判是不是同一张, 不能用 `other == tile`: 协议写
+        # 赤 5 作 "0p" 而普通 5 是 "5p", 字符串不相等 —— 于是手里那张赤 5p
+        # 会把自己判成"形不中性", 暗杠 5p 永远做不成(2026-10-18 探针实锤).
+        if other_rank == rank:
+            continue
+        if abs(other_rank - rank) <= _KAN_NEIGHBOR_REACH:
+            return False
+    return True
+
+
 def pick_meld_button(tiles: list[str], buttons: Mapping[str, object], *,
                      meld_policy: str, missing_slots: int = 0,
                      meld_min_conf: float = 0.0,
@@ -660,6 +787,10 @@ def pick_meld_button(tiles: list[str], buttons: Mapping[str, object], *,
     单独抽出来是因为双标签重叠守卫(见 decide_turn 第 5.0 步)必须回答
     "若没有重叠, 这一手会不会点鸣牌" —— 判据若两处各写一份, 迟早漂移.
     kan_only 的暗杠分支判据不同(四张 + 我方出牌回合), 不在这里.
+
+    这里只会选**暗杠/加杠**(张数 %3==2 的那一刻), 大明杠恒不选: 它是"别人
+    打出的牌 + 手里三张", 破门清且让这一手立刻无役 —— 我们只碰役牌、靠门清
+    立直, 这条禁令比任何置信度都硬(见下面循环里的说明).
 
     melded 是**我方本手副露里的牌**(由任务层从手牌差集反推, 见
     meld_taken_kinds): 杠的手牌支持判据必须覆盖**加杠** —— 副露里已有
@@ -673,12 +804,32 @@ def pick_meld_button(tiles: list[str], buttons: Mapping[str, object], *,
         for name in names:
             if name not in buttons:
                 continue
+            if name == BUTTON_GANG and not is_my_discard_turn(len(tiles)):
+                # **大明杠一律不做**(2026-10-18 实跑: 别家打 2z、我们手里三张,
+                # 点了 gang —— 客风杠出去门清没了、这一手直接变成无役, 后面
+                # 听了 1m/4m 也荣和不了, 白打一手).
+                # 判据是**张数**: 暗杠/加杠只可能发生在"自己刚摸完牌"那一刻
+                # (14/11/8/5/2 张, %3==2); 大明杠是"别人打出的牌 + 手里三张",
+                # 那时暗牌是 13/10/7(%3==1), 两个集合不相交.
+                # 放在 supported/conf 判断**之前**: 大明杠是策略禁令, 不是
+                # "置信度不够就先放过"—— conf 再高也不点.
+                continue
             if name == BUTTON_PENG:
                 supported = (not missing_slots
                              and any(tiles.count(t) >= 2 for t in set(tiles)))
             else:
+                # 只剩暗杠与加杠(大明杠上面已经拦掉).
+                # 暗杠: 手里四张同牌, 且不能拆了手里的搭子(见 kan_keeps_shape).
+                #   手里 7777 而旁边还搁着 89m 时, 暗杠会把 789m 一并拆掉 ——
+                #   为翻数退向听, 不值.
+                # 加杠: 副露里已碰的三张 + 手里刚摸到的第四张. **不需要形中性
+                #   那一关** —— 加杠的对象必然是碰过的牌, 而我们只碰役牌, 役牌
+                #   全是字牌, 字牌组不成顺子, 自然拆不了任何搭子.
+                #   (顺带: 三麻的 1m/9m 同样不成顺, 所以三麻里形中性只对
+                #   筒子索子真正生效, 万子与字牌恒为中性.)
                 supported = (not missing_slots and (
-                    any(tiles.count(t) >= 3 for t in set(tiles))
+                    any(tiles.count(t) >= 3 and kan_keeps_shape(t, tiles)
+                        for t in set(tiles))
                     or any(melded.count(t) >= 3 and tiles.count(t) >= 1
                            for t in set(melded))))
             if not supported and _button_conf(buttons, name) < meld_min_conf:
@@ -700,7 +851,8 @@ def would_click_meld(tiles: list[str], buttons: Mapping[str, object], *,
     if meld_policy == "kan_only":
         return (BUTTON_GANG in buttons
                 and is_my_discard_turn(len(tiles)) and not missing_slots
-                and any(tiles.count(t) >= 4 for t in set(tiles))
+                and any(tiles.count(t) >= 4 and kan_keeps_shape(t, tiles)
+                        for t in set(tiles))
                 and _button_conf(buttons, BUTTON_GANG) >= meld_min_conf)
     return pick_meld_button(tiles, buttons, meld_policy=meld_policy,
                             missing_slots=missing_slots,
@@ -725,7 +877,13 @@ def decide_turn(
     button_centers: Mapping[str, Sequence[float]] | None = None,
     blurry_draw: bool = False,
     melded: Sequence[str] = (),
+    my_turn: bool | None = None,
+    proto_turn: bool | None = None,
+    proto_meld: bool | None = None,
+    round_open: bool | None = None,
+    ev_rank: Sequence | None = None,
     rng: random.Random | None = None,
+    drawn_tile: str | None = None,
 ) -> TurnDecision:
     """决定这一轮干什么.
 
@@ -755,6 +913,34 @@ def decide_turn(
     退向(2026-10-09 实锤: 刚摸的 8p 被读成 4p, 牌效按幻影 4p 算出打 6m
     "保持听牌", 真手牌直接退向). 摸切是唯一**位置无关**的安全打 —— 不管
     那张牌实际是什么, 打出去都不改变听牌状态.
+
+    my_turn 是**协议对"现在是不是我该动"的权威说法**(见
+    net.state.protocol_says_my_turn): 只有接管档会传, 且桥不新鲜时调用方传
+    None(不参战). 传 False = 服务端明确"不轮到你" -> 这一轮一律不动, 挡的是
+    "过场画面里牌河被读成手牌、张数刚好合法, 于是点出去一张牌"那类事故
+    (见 hand_count_ok 的说明). 传 True **不改变**任何决策 —— 协议只做否决,
+    不做指令: 它说"轮到你"也仍要看牌效算出来的结果.
+
+    proto_turn 是同一个协议说法的**窄口径**(调用方**每个档位都传**), 只用来
+    过滤**立直按钮**: 立直只可能出现在"我自己摸牌后正要出牌"那一刻, 协议说
+    这一刻没有我的出牌操作(type 1)就说明那个按钮是误读(2026-10-17 东三局:
+    假 lizhi 0.714 出现在协议给"碰"的那一帧)。与 my_turn 分开的理由是**代价
+    不对称**: 漏立直只少一番, 而把"过期的操作列表"当否决去挡出牌会把整手牌
+    拖进托管 —— 所以整轮否决仍然只在接管档, 这道只挡立直。
+
+    proto_meld 是协议说"此刻开着**给我的**鸣牌窗口"(offered 里有吃/碰/大明杠)。
+    它存在的唯一理由是给 my_turn 那道整轮否决开一个口子: 鸣牌窗口里协议本来
+    就只给鸣牌操作、不给打牌操作, my_turn=False 是**正常读数**而不是"不轮到你"
+    (见第 1.5 步)。传 None(拿不到协议/关着) = 不开口子, 否决照旧。
+
+    ev_rank 是**出牌的新目标函数**(见 tuning.EV_EVAL_TAKEOVER): 由调用方把
+    `ev_eval.evaluate_discards()` 的结果原样传进来, 最优在前. 有它时, "出牌
+    挑哪一张"由它决定(期望打点 = 和牌率 x 和牌打点, 扣着牌河算进张、带着
+    宝牌算打点); 没有 / 落不了地 / 引擎给不出结论 -> 回退到原来的牌效
+    (`choose_discard`). 它**只替换"挑哪一张"** —— 稳健出牌、听牌摸切守卫、
+    `allowed_indices`、张数与可信度闸门全部在它之前, 坏输入根本到不了这一步;
+    立直选牌态里也只用它在高亮集合内挑(见第 3 步).
+
     """
     rng = rng or random
 
@@ -762,6 +948,49 @@ def decide_turn(
     for name in BUTTON_WIN:
         if name in buttons:
             return TurnDecision(ACTION_WIN, button=name, reason="能和就和")
+
+    # 1.5) 协议权威闸(见 my_turn 的说明): 服务端明确说"不轮到你" -> 不动.
+    #
+    # **必须放在和牌之后**: 桥可能滞后半拍(操作列表还没推过来), 而"漏和"的
+    # 代价(整手白打)远大于"少鸣一次", 所以和牌/自摸永远优先, 协议无权否决它.
+    # 这一闸挡的不是"时机判断不准", 而是**幻觉读数点出去一张牌**: 过场画面里
+    # 牌河被读成手牌、张数刚好落在合法集合的那类事故, 视觉侧所有闸门都会放行,
+    # 而协议说"不是你"是当时能拿到的最硬证据.
+    if my_turn is False and not (proto_meld
+                                 and not is_my_discard_turn(len(tiles))):
+        # 例外(2026-10-17 真机实锤, 2026-10-21 改挂在协议上): **鸣牌窗口本身
+        # 就是"有吃/碰/杠操作、无出牌操作"** —— 夹具 `liqi_sanma_2rounds`
+        # 里两次 `ActionDiscardTile` 给的 operation_list 都是 `[3]`(只有碰),
+        # 没有 type 1, 所以 my_turn=False 恰恰是"这是个鸣牌窗口"的**正常**读数,
+        # 拿它去否决就把整个窗口拦成 wait/skip(那一局 23 次想碰, 一嘴都没点
+        # 出去). `proto_meld` 是协议对"此刻开着给我的鸣牌窗口"的正面说法
+        # (offered 里有 2 吃 / 3 碰 / 5 大明杠), 与 my_turn 同源同硬; 两者同时
+        # 成立 = 协议确认这是鸣牌窗口 -> 不否决, 交给第 5 步的规则判"点不点"
+        # (它自己会因为该我出牌/没役对/按钮不在画面而不鸣). 其余情形(残留
+        # 按钮/幻觉读数, proto_meld 为 None 或 False)照旧一律不动.
+        #
+        # 视觉侧还要**独立同意**(`not is_my_discard_turn`): 14 张是我刚摸完牌
+        # 的形状, 那时协议还挂着鸣牌机会说明桥滞后了一拍 —— 那种时候不值得
+        # 为它放开整轮否决.
+        #
+        # 二次实锤(2026-10-17 17:59 局): 决定"不鸣"时老逻辑在窗口里干等
+        # 整段倒计时(~10s, jsonl 连续 20+ 条 wait) —— 但倒计时走完的终点
+        # 本来就是"自动不鸣", 等待只是白耗全桌时间. 这道闸的前提取自
+        # _proto_clock_read: offered 非空且无出牌 = 协议**确认**此刻开着
+        # 一个操作窗口, 视觉里的「跳过」按钮是真按钮, 点它 = 立刻 Decline,
+        # 游戏马上往下走. 护栏: 拔北窗口不走这里(拔北永远拔, 见下)、
+        # 张数必须还是 13(鸣牌窗口的形状; 幻觉读数的张数五花八门, 让它
+        # 继续吃 WAIT)、按钮必须真的在画面. 顺序 bug(不鸣被误判成可鸣)
+        # 的方向是"多等 10 秒", 不会误点 —— 与"误立直"不同, 没有状态机
+        # 代价, 点击走按钮动作的双帧确认.
+        if (BUTTON_SKIP in buttons and BUTTON_BABEI not in buttons
+                and not is_my_discard_turn(len(tiles))):
+            return TurnDecision(
+                ACTION_SKIP, button=BUTTON_SKIP,
+                reason="协议确认是鸣牌窗口且决定不鸣, 点跳过立刻过")
+        return TurnDecision(
+            ACTION_WAIT,
+            reason="协议说现在不轮到我，这一轮不动（防幻觉读数点出去）")
 
     concealed = len(tiles)
     # sane = "张数像真的认全了". 比纯数学的合法张数多一道下限, 见
@@ -789,6 +1018,39 @@ def decide_turn(
     #
     # 唯一的硬保护是置信度: 立直不可撤销, 按钮认得不够确定就宁可不点.
     if allow_riichi and BUTTON_RIICHI in buttons:
+        # 立直按钮**只可能出现在"我自己摸牌后、正要挑一张打出去"的那一刻**.
+        # 这条前提有两个独立、都不贵的检查, 任一不成立就是误检:
+        #   ① 张数必须是"摸牌后"那一档(14/11/8/5/2);
+        #   ② 协议(可用时)必须说这一刻有我的出牌操作(type 1).
+        # 2026-10-17 东三局: 那一刻手里 **13 张**、协议给的可用操作是
+        # **碰**(type 3) —— 两条任意一条都能拦住那个 lizhi(conf 0.714);
+        # 而它是从"上家立直"的宣告画面里被误读出来的(用户核对回放指出).
+        #
+        # 为什么单独给立直加这两道: 立直误判的代价**不对称** ——
+        # 漏立直只少一番, 这手照打, 下一帧按钮还在; 误立直则把状态机带进
+        # "我在挑宣言牌", 整手牌报废(见 PlayOneGameTask 立直状态机).
+        # 因为只否决立直、否决不了任何别的动作, 所以两条都可以不看档位,
+        # 不会有"把整手牌拖进托管"的反向风险.
+        #
+        # 张数那道只在**读数够多**时才敢当反证(concealed >= MIN_CONCEALED):
+        # 手牌区几乎空着时读数本身就是幻觉, 拿它去否决一个真按钮违背了
+        # "按钮比手牌判断可靠"这条既定原则(见上面 2) 的说明).
+        if concealed >= MIN_CONCEALED and not is_my_discard_turn(concealed):
+            return TurnDecision(
+                ACTION_WAIT,
+                reason=f"立直按钮出现在手牌 {concealed} 张这一刻"
+                       f"（不是摸牌后的张数），当误检")
+        if proto_turn is False:
+            return TurnDecision(
+                ACTION_WAIT,
+                reason="协议说这一刻没有我的出牌操作，立直按钮当误检")
+        if round_open is False:
+            # 协议说这一手已经结束了(胡牌/流局看过收尾报文) —— 结算画面上
+            # 残留的手牌行读出的"立直按钮"只能是误读(2026-10-17 真机:
+            # 别家胡牌后 12s, 我们在结算画面上"稳健打出"了一张 9p).
+            return TurnDecision(
+                ACTION_WAIT,
+                reason="协议说这一手已经结束，立直按钮当误检")
         conf = conf_of(buttons, BUTTON_RIICHI)
         if conf < riichi_min_conf:
             return TurnDecision(
@@ -806,6 +1068,16 @@ def decide_turn(
     # 3) 立直选牌态: **直接出牌**, 牌效只在高亮牌里挑. 优先级高于拔北/
     #    吃碰杠/跳过 -- 选牌态下点别的按钮都是无效操作, 而点高亮牌就完成
     #    了宣言, 这是当前唯一能推进局面的动作.
+    #
+    # 前提是"**摸牌后**、手里 14/11/8/5/2 张, 要挑一张当宣言牌". 张数不是那
+    # 一档就说明这个"选牌态"是误判, 当场作废、落回普通判断 —— 2026-10-17
+    # 东三局实锤: 一个假立直按钮(conf 0.714, 协议当帧就判为误检)把状态机
+    # 带了进来, 之后整整 26 秒拿着 **13 张牌** 反复走下面的牌效, 每次都抛
+    # `needs a post-draw hand` —— 而那段没有出口, 只能等摸到第 14 张才自己
+    # 解开; 摸到之后又把一张普通牌当宣言牌打了出去, 置上"立直生效", 整局
+    # 不再主动出牌, 出牌权全被雀魂托管接管.
+    if allowed_indices is not None and not is_my_discard_turn(concealed):
+        allowed_indices = None
     if allowed_indices is not None:
         allowed = [i for i in allowed_indices if 0 <= i < len(tiles)]
         if not allowed:
@@ -831,6 +1103,16 @@ def decide_turn(
                        f"{[tiles[i] for i in bad_idx]}（槽位 {bad_idx}），"
                        f"先不动(选牌态不走稳健出牌)")
         allowed_tiles = {tiles[i] for i in allowed}
+        # 宣言牌优先用 EV 排序(与高亮集合取交), 引擎给不出结论就回退牌效.
+        row = pick_by_ev_rank(tiles, ev_rank, allowed_tiles)
+        if row is not None:
+            tile = ev_tile_of(row)
+            index = pick_tile_index(tiles, tile, rng, allowed_indices=allowed,
+                                    drawn_tile=drawn_tile)
+            if index is not None:
+                return TurnDecision(
+                    ACTION_DISCARD, tile=tile, index=index,
+                    reason=f"立直宣言牌(按EV排序{ev_row_note(row)}，只打高亮牌)")
         try:
             plan = choose_discard(tiles, meld_count_of(concealed), rng=rng,
                                   player_count=player_count,
@@ -838,7 +1120,9 @@ def decide_turn(
         except Exception as e:  # noqa: BLE001
             return TurnDecision(ACTION_WAIT, suspect=True,
                                 reason=f"牌效计算失败({e})")
-        index = pick_tile_index(tiles, plan.tile, rng, allowed_indices=allowed)
+        index = pick_tile_index(tiles, plan.tile, rng,
+                                allowed_indices=allowed,
+                                drawn_tile=drawn_tile)
         if index is None:
             return TurnDecision(ACTION_WAIT, suspect=True,
                                 reason=f"要打的 {plan.tile} 不在认出的高亮牌里")
@@ -864,7 +1148,8 @@ def decide_turn(
             return TurnDecision(ACTION_BABEI, button=BUTTON_BABEI,
                                 reason="手里有北, 拔一张换牌(等同加杠)")
 
-    # 5) 吃碰杠: 默认不动, 保持门清
+    # 5) 吃碰杠: 现行档 `MELD_POLICY="peng"` —— 吃永不点(会破门清且要选组合条),
+    #    碰只在手里有役牌对子时点, 杠见下.
     #
     # 5.0) 双标签重叠守卫(2026-10-08 新增, 同晚实跑后**条件化**): 同一个
     #      按钮被认成两类时(见 MELD_LABEL_OVERLAP_TOL 的数据依据), 标签
@@ -903,12 +1188,13 @@ def decide_turn(
             return TurnDecision(ACTION_MELD, button=BUTTON_GANG,
                                 reason="手里四张, 暗杠不破门清")
         # 明杠 / 看不懂的杠机会: 落到第 6 步点"跳过", 保持门清.
-    if meld_policy not in ("none", "kan_only"):
-        # "peng" = 杠都点; 碰只在手里有役牌对子时点(见 has_yaku_pair);
-        # 吃永不点: 有多种吃法时雀魂会弹组合选择条, 那个界面没有建模, 点了
-        # 吃按钮弹出来就卡死. 碰/杠永远单一选项, 点按钮直接生效.
+    if meld_policy != "none":
+        # "peng" = 碰只在手里有役牌对子时点(见 has_yaku_pair); 杠只点**暗杠
+        # 与加杠**(不破门清), **大明杠不做**(破门清 + 立刻无役, 见
+        # pick_meld_button 里的张数判据); 吃永不点 —— 有多种吃法时雀魂会弹
+        # 组合选择条, 那个界面没有建模, 点了吃按钮弹出来就卡死. 碰/杠永远是
+        # 单一选项, 点按钮直接生效.
         # "all" = 不设条件全点(仅在明确要求时启用).
-        #
         # **按钮真实性 = 手牌支持**(2026-10-08 两次实锤合订):
         #   - 20:47 局: 「吃」被 UI 模型误报成 gang(0.52), "杠都点"点了,
         #     实际执行了吃 —— 那次手里**没有三张同牌**, 杠机会不可能存在.
@@ -924,8 +1210,10 @@ def decide_turn(
                                 missing_slots=missing_slots,
                                 meld_min_conf=meld_min_conf, melded=melded)
         if name:
-            reason = (f"有役牌对子, {meld_policy}" if name == BUTTON_PENG
-                      else f"meld_policy={meld_policy}")
+            if name == BUTTON_PENG:
+                reason = f"有役牌对子, {meld_policy}"
+            else:
+                reason = f"meld_policy={meld_policy}"
             return TurnDecision(ACTION_MELD, button=name, reason=reason)
 
     # 6) 跳过: 有吃碰杠机会但我们不要(拔北的取消键除外, 见上)
@@ -946,6 +1234,16 @@ def decide_turn(
 
     # 8) 出牌
     if is_my_discard_turn(concealed) and sane:
+        if round_open is False:
+            # 收局守卫(2026-10-17 真机实锤): 别家胡牌后, 和了演出/结算画面
+            # 底下的手牌行还在, 视觉照样能读出一手"稳定"的牌并决定出牌 ——
+            # 那一刻桥已报"这一手结束"(round_open=False), 协议其余闸门都因
+            # available()=False 而不参战, 这里是唯一还开着的手电筒. 胡牌之后
+            # 不存在任何合法出牌, 这张读数必然是画面残留, 不出.
+            return TurnDecision(
+                ACTION_WAIT,
+                reason="协议说这一手已经结束（有人胡牌/流局），结算画面的手牌"
+                       "是残留读数，不出牌")
         # 8.0) 读数可信度硬闸(2026-10-08 21:45 局实锤): "东2局0本场"过场画面
         # 上手牌行位置摆的是牌桌残留牌, 模型读出 8 张全低置信(conf 0.15-0.72),
         # 张数 8 恰好是"2 副露"的合法张数 -- 闸门和张数判据全被绕过, 稳健
@@ -1013,7 +1311,7 @@ def decide_turn(
                 robust = robust_discard(tiles, suspect_idx,
                                         meld_count_of(concealed),
                                         player_count=player_count)
-            except Exception as e:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 # 稳健算法出任何问题都不能连累这一轮出牌, 退回普通逻辑.
                 # 不抛也不wait: 这里的异常只可能来自 jansou 内部, 而普通
                 # 路径用的是同一个函数, 它要是能算, 下面就一定能算.
@@ -1029,7 +1327,8 @@ def decide_turn(
                         reason=f"稳健枚举 {robust.cases} 种假设没有一种凑出"
                                f"合法手牌（{len(suspect_idx)} 张没认准），"
                                f"读数不可信，先不动")
-                index = pick_tile_index(tiles, robust.tile, rng)
+                index = pick_tile_index(tiles, robust.tile, rng,
+                                        drawn_tile=drawn_tile)
                 if index is None:
                     return TurnDecision(
                         ACTION_WAIT, suspect=True,
@@ -1049,6 +1348,22 @@ def decide_turn(
                            f"（槽位 {suspect_idx}），"
                            f"枚举了 {robust.cases} 种可能{extra}{gap_note}")
 
+        # 8b) 出牌: 有 EV 排序就用它(**新目标函数**), 引擎给不出结论就回退牌效.
+        #
+        # 走到这里手牌已经是"干净"的: 低置信槽位 / 这个人数下不存在的牌要么
+        # 在上面被拦下, 要么走了稳健出牌并已返回 —— 读数可以全信, 正好交给
+        # 估值引擎. keep_kinds(役对)在这条路上**不单独施加**: 它是给牌效那把
+        # 尺子打的补丁(牌效看不见"役"), 而 EV 引擎带着宝牌/役种算期望打点,
+        # "这役对该不该留"由它自己回答. 回退路径仍然带着 keep_kinds, 一行没动.
+        row = pick_by_ev_rank(tiles, ev_rank)
+        if row is not None:
+            tile = ev_tile_of(row)
+            index = pick_tile_index(tiles, tile, rng,
+                                    drawn_tile=drawn_tile)
+            if index is not None:
+                return TurnDecision(
+                    ACTION_DISCARD, tile=tile, index=index,
+                    reason=f"EV最优{ev_row_note(row)}{gap_note}")
         try:
             # keep_kinds(2026-10-09 東2局实锤): meld_policy=peng 时手里的
             # 役牌对子是碰的资本(碰出去自带役), 出牌平分时不能优先打掉它 --
@@ -1062,7 +1377,8 @@ def decide_turn(
         except Exception as e:  # noqa: BLE001
             return TurnDecision(ACTION_WAIT, suspect=True,
                                 reason=f"牌效计算失败({e})")
-        index = pick_tile_index(tiles, plan.tile, rng)
+        index = pick_tile_index(tiles, plan.tile, rng,
+                                drawn_tile=drawn_tile)
         if index is None:
             return TurnDecision(ACTION_WAIT, suspect=True,
                                 reason=f"要打的 {plan.tile} 不在认出的手牌里")
@@ -1091,4 +1407,15 @@ def decide_turn(
             ACTION_WAIT, suspect=True,
             reason=f"手牌行里有约 {missing_slots} 张牌的空档（间距对不上），"
                    f"只认出 {concealed} 张，张数不可信，不按“在等别人”处理")
+    if my_turn is True:
+        # 协议**明确说轮到我**了, 而视觉这一帧没有"该我打牌"的张数(13/10/7
+        # 而不是 14/11/8). 差别不只是文案: "在等别人"会让上层按正常空转处理,
+        # 而真相是"协议已经把我这一动推过来了, 视觉晚了一帧" —— 那种情况下
+        # 根本不该等, 应该立刻重看(2026-10-18 13:48 局: 每次摸牌后都撞上这个,
+        # 日志写"在等别人", 看上去像是时机判断错了, 其实只是摸的那张还没画完).
+        # 不给 suspect: 它是一帧的过渡, 不是感知故障, 不该进留证/卡死统计.
+        return TurnDecision(
+            ACTION_WAIT,
+            reason=f"协议说轮到我打牌，但这一帧视觉只读出 {concealed} 张"
+                   f"（该是摸牌后的张数），等下一帧重看")
     return TurnDecision(ACTION_WAIT, reason="在等别人")

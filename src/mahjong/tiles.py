@@ -148,3 +148,57 @@ def counts(tiles: list[str]) -> dict[str, int]:
         tile = parse_tile(tile)
         result[tile] = result.get(tile, 0) + 1
     return result
+
+
+#: 雀魂理牌的顺序: 万 -> 筒 -> 索 -> 字.
+_SCREEN_SUIT = {"m": 0, "p": 1, "s": 2, "z": 3}
+
+
+def screen_key(tile: str) -> tuple[int, int, int]:
+    """协议牌名 -> 屏幕上理牌顺序的排序键.
+
+    第 1 位花色(万筒索字), 第 2 位数字, 第 3 位"是不是赤 5".
+
+    **赤 5 排在普通 5 的左边**(第 3 位 0 < 1): 实测屏幕手牌排序里 `0p` 在
+    `5p` 左侧 —— 这是"赤 5 到底在哪一槽"唯一的离线判据, 也是本函数存在的
+    理由. 唯一例外是**刚摸到的那张**, 它在最右独立槽, 不进这个排序
+    (见 `screen_order` 的 `drawn`).
+    """
+    raw = str(tile).strip().lower()
+    num, suit = raw[0], raw[-1]
+    aka = num == "0"
+    if suit not in _SCREEN_SUIT or not num.isdigit():
+        raise ValueError(f"无法解析的牌: {tile!r}")
+    return (_SCREEN_SUIT[suit], 5 if aka else int(num), 0 if aka else 1)
+
+
+def screen_order(tiles, *, drawn: str | None = None) -> list[str]:
+    """协议暗手 -> **屏幕上从左到右**的牌名序列.
+
+    协议给的 `hand` 是"发牌 + 摸牌"的追加顺序, 不是屏幕顺序; 而点击是按
+    屏幕槽位下标点的. 雀魂把暗牌按 `screen_key` 理好.
+
+    `drawn` 是**协议里刚摸到的那张的牌名**(`GameState.drawn`, 来自
+    `ActionDealTile.tile`): 它被客户端单独摆在最右(中间留一道缝), 不进
+    排序 —— 序列 = `sort(其余)` + `[drawn]`. 必须用**牌名**而不是"列表
+    末位"来认它:
+
+      - 2026-10-18 16:21 局实锤: 鸣牌之后手里 11 张(%3==2)但**没有摸牌**,
+        客户端把 11 张全部重排, 协议列表末位的 3p 被排序进筒子中间;
+        按"末位=刚摸"钉到最右, 从 3p 起整体串一格, 点"9p"打出 4p;
+      - 新手第一巡客户端先显示 14 张**连续**排序、过一会儿才把摸牌分出去
+        (16:21 局 frame 佐证: 同一手前一帧末槽框距均匀、后一帧出现缺口),
+        此时按"末位独立槽"铺标签同样串位.
+
+    `drawn=None` 的场合: 整手一起排(等待帧 / 鸣牌后等出牌 / 客户端还没把
+    摸牌分出去的帧).
+    """
+    body = [str(t) for t in tiles]
+    if drawn is not None and body.count(str(drawn)) > 0:
+        body.remove(str(drawn))
+        body.sort(key=screen_key)
+        body.append(str(drawn))
+        return body
+    body.sort(key=screen_key)
+    return body
+

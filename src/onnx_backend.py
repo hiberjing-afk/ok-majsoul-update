@@ -20,7 +20,7 @@
   ultralytics non_max_suppression(agnostic=False) 同语义.
 
 类别名/stride 从 ONNX 的 metadata_props 里读(ultralytics 导出时写入),
-不需要 .pt 在场.
+经 onnxruntime 的 `get_modelmeta()` 获取, **不需要 onnx 包, 也不需要 .pt 在场**。
 """
 
 from __future__ import annotations
@@ -181,7 +181,6 @@ def _clip_augmented(out: np.ndarray, input_hw: tuple[int, int],
     anchor 数是 P5 的 4^(nl-1) 倍. position 是本 pass 在 TTA 序列里的
     下标: 只有第一份裁尾(它的输入最大, P5 特征图最没信息)、最后一份裁头.
     """
-    a_last = (input_hw[0] // stride) * (input_hw[1] // stride)
     g = sum(4 ** x for x in range(nl))             # = (4^nl - 1) / 3
     n = out.shape[2]
     if position == 0 and total_passes > 1:
@@ -225,8 +224,17 @@ class OnnxDetector:
         providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
         self._session = ort.InferenceSession(str(self.onnx_path),
                                              providers=providers)
-        meta = {m.key: m.value for m in
-                __import__("onnx").load(str(self.onnx_path)).metadata_props}
+        # 类别名/stride 走 session 自带的 get_modelmeta, **不 import onnx 包**
+        # (2026-10-13 回归点): 旧实现是 __import__("onnx").load(...).
+        # metadata_props, 而 onnx 不在 requirements.txt 里 —— 实测完整依赖树
+        # 46 个包无 onnx(onnxruntime-directml 只要 flatbuffers/numpy/packaging/
+        # protobuf/sympy), 开发机上之有是 onnxslim 顺带装的。朋友按
+        # requirements.txt 全新安装后第一次推理即
+        # ModuleNotFoundError: No module named 'onnx'。且 OnnxDetector 懒加载,
+        # 没有任何单测真的调用过 _load(), CI 一直绿。onnx 包 100MB+, 只为读
+        # 两个 metadata 键不值当; get_modelmeta 返回的 custom_metadata_map
+        # 与 onnx.load().metadata_props 逐键一致(两个生产权重实测)。
+        meta = dict(self._session.get_modelmeta().custom_metadata_map)
         self._names = {int(k): str(v) for k, v in
                        ast.literal_eval(meta["names"]).items()}
         self._num_classes = len(self._names)
