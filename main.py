@@ -114,7 +114,7 @@ def apply_overrides(pairs: list[tuple[str, object]], once: bool) -> None:
     allowed = ALLOWED_KEYS[TARGET_TASK]
     for key, value in pairs:
         if not key:
-            print(f"[WARN] 忽略空的配置键")
+            print("[WARN] 忽略空的配置键")
             continue
         if key not in allowed:
             print(f"[WARN] 未知配置键 {key!r}, 已忽略. "
@@ -201,9 +201,9 @@ def main() -> None:
 
     multiprocessing.freeze_support()
 
-    from src.config import config
-
     import ok
+
+    from src.config import config
 
     ok_instance = ok.OK(config)
     ok_instance.start()

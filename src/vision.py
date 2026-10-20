@@ -22,8 +22,8 @@
 选中态与未选中态差了两个数量级, 所以用一个很宽松的阈值就能可靠区分,
 不会因为主题 / 亮度差异误判.
 
-文件下半部分的 StuckDetector 与颜色无关, 是"这局是不是已经不在继续了"的判据,
-理由写在它自己的注释里.
+同一套思路也用于对局内左上操作条的自动开关: 开 = 亮绿字, 关 = 灰蓝字
+(`is_toggle_green`).
 """
 
 from __future__ import annotations
@@ -137,71 +137,3 @@ def is_toggle_green(frame: np.ndarray, box: Box, threshold: float = 0.02) -> boo
 #
 # 阈值取 40 轮: 对局里"在等别人"最长是等 3 家的回合计时(雀魂单回合约 6~10 秒,
 # 托管上限 30 秒), 40 轮 × 0.3 秒 = 12 秒已经远超正常等待.
-
-STUCK_HAND_FRAMES = 40
-
-
-class TurnTrace:
-    """一轮对局的"感知轨迹", 用来判断画面是不是已经不动了.
-
-    只存手牌张数和按钮类别名 -- 都是短字符串/整数, 存几百轮也不占地方,
-    而且可以直接进单测(不需要截图).
-    """
-
-    def __init__(self, hand_count: int, buttons: frozenset[str] | set[str]):
-        self.hand_count = hand_count
-        self.buttons = frozenset(buttons)
-
-    def same_as(self, other: "TurnTrace") -> bool:
-        return (self.hand_count == other.hand_count
-                and self.buttons == other.buttons)
-
-    def __repr__(self) -> str:  # pragma: no cover - 只为调试好看
-        return f"TurnTrace(hand={self.hand_count}, buttons={sorted(self.buttons)})"
-
-
-class StuckDetector:
-    """判断"对局已经不在继续了, 但我们还没认出来".
-
-    判据(三条同时满足):
-        1. 连续 N 轮感知结果完全一样(手牌张数 + 按钮集合);
-        2. 这 N 轮里没有任何动作被执行;
-        3. 期间手牌张数一直是合法值(牌确实还在那儿, 不是"认不出来").
-
-    只用 1+2 就够, 第 3 条留着是为了不把"手牌还没发完的开局动画"误判成卡死
-    (那种情况手牌张数在快速变化, 本来也不满足 1).
-    """
-
-    def __init__(self, threshold: int = STUCK_HAND_FRAMES):
-        self.threshold = max(1, int(threshold))
-        self._last: TurnTrace | None = None
-        self._same_count = 0
-        self._acted_since_change = True
-
-    def reset(self) -> None:
-        self._last = None
-        self._same_count = 0
-        self._acted_since_change = True
-
-    def feed(self, hand_count: int, buttons: set[str] | frozenset[str],
-             acted: bool = False) -> bool:
-        """喂一轮的感知结果, 返回"是否已判定卡死".
-
-        acted = 这一轮是否执行了动作(出牌 / 点了某个按钮).
-        """
-        trace = TurnTrace(hand_count, buttons)
-        if self._last is not None and trace.same_as(self._last):
-            self._same_count += 1
-        else:
-            self._same_count = 1
-            self._last = trace
-            self._acted_since_change = False
-        if acted:
-            self._acted_since_change = True
-        return (self._same_count >= self.threshold
-                and not self._acted_since_change)
-
-    @property
-    def same_count(self) -> int:
-        return self._same_count
-

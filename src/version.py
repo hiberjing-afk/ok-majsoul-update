@@ -1,12 +1,12 @@
 """版本与更新来源的单一出处.
 
-发布流程见 docs/RELEASE.md。发布前必须把 UPDATE_REPO 填成真实的
-GitHub 仓库（owner/repo 形式），否则启动时跳过更新检查。
+发布流程见 docs/RELEASE.md。`UPDATE_REPO` 是主仓库的 owner/repo；留空会
+跳过启动时的更新检查。
 """
 
 from __future__ import annotations
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 # GitHub 仓库（owner/repo）。空字符串 = 未发布状态，跳过更新检查。
 UPDATE_REPO = "hiberjing-afk/ok-majsoul"

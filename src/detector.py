@@ -18,7 +18,7 @@ detector/ 下提交的成品, 所以不要改 models/ 里的文件名, 也不要
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -102,9 +102,7 @@ UI_IMGSZ = 640
 # **这里有两个门槛, 职责完全不同, 别再混起来看**:
 #
 #   TILE_CONF      "这个槽位上有没有牌"  -> 决定**张数**(occupancy).
-#   MIN_TILE_CONF  "认出来的这张牌是几"  -> 决定**标签可不可信**
-#                  (见 src/detection.MIN_TILE_CONF, 低于它的槽位喂给
-#                   稳健出牌 robust_discard 去枚举)
+#   MIN_TILE_CONF  "认出来的这张牌是几"  -> 识别质量的标尺(见 tuning).
 #
 # TILE_CONF 从 0.40 降到 0.15 的依据(2026-10-07 实跑帧逐张核对):
 #
@@ -126,9 +124,8 @@ UI_IMGSZ = 640
 #
 # 代价与兜底: 门槛降低会多留一些低置信框, 但
 #   - 每槽只留最优(倍率 1.00~1.05 的等间距, 分槽很干净);
-#   - 低于 MIN_TILE_CONF 的槽位不算"认准", 会走稳健出牌;
-#   - 张数仍然要过 is_plausible_concealed + missing_slots 两道关;
-#   - 协议对账(net.assist.reconcile_hand)会把标签整体换成协议真值.
+#   - 张数仍然要过 missing_slots 这道关;
+#   - 对局内核只拿视觉的**框坐标**, 牌名/标签一律来自协议.
 # 也就是说: 低置信框只影响"有几张牌"这个几何事实, 不会直接被当成确定标签用.
 TILE_CONF = 0.15
 # UI 模型跑整帧. 按钮比手牌大得多, 640 已经够.
@@ -171,11 +168,6 @@ class HandReading:
     missing_slots: int = 0
 
     @property
-    def reliable(self) -> bool:
-        """张数可不可信. False 时不要按"张数"下任何结论(包括"在等别人")."""
-        return self.missing_slots == 0
-
-    @property
     def count(self) -> int:
         return len(self.tiles)
 
@@ -183,33 +175,6 @@ class HandReading:
         if 0 <= index < len(self.boxes):
             return self.boxes[index]
         return None
-
-
-def with_labels(hand: HandReading,
-                labels: Sequence[str]) -> HandReading:
-    """把对账后的**标签**套回 hand, 其余字段**原样保留**.
-
-    用途: 协议对账(net.assist.reconcile_hand)把视觉读出的标签整体换成协议
-    真值时, 坐标/置信度/missing_slots 都必须是当帧事实, 只有"这张牌叫什么"
-    换成协议给的.
-
-    为什么用 `dataclasses.replace` 而不是重新构造一个 HandReading:
-    这个函数原来是逐字段重新构造的, 于是新加的 `missing_slots` 被悄悄丢成
-    默认值 0 —— 而 0 的含义是"张数可信", 正好与事实相反, 上游于是又拿一个
-    巧合合法的张数(10 = 1 副露)去判"在等别人", 回到 2026-10-07 那次静默空转.
-    `replace()` 让"漏搬迁字段"在结构上不可能发生: 以后 HandReading 再加字段,
-    这里不用改也丢不了.
-
-    **坐标和置信度一律保留当前帧的测量值**(2026-10-07 改): 传进来的 labels
-    只是"这张牌叫什么", 框本身还是 `hand.boxes` 里的 —— 原来是把投票选中的
-    **那个框**(可能来自好几帧之前)整个换进来, 于是 jsonl 记的 conf / 坐标
-    不是当帧实测, 事后拿留证帧重跑模型根本对不上(实测 t164). 现在被改过标签
-    的那个框, 置信度仍然是它**当帧**的观测值: 它低, 就照样进 `low_confidence`
-    走稳健出牌 —— 因为"这一槽当帧没认准"本身就是真话. 也正因为几何不动,
-    这里绝不拿新标签重算间距(否则 missing_slots 又变成一个假数).
-    """
-    boxes = [replace(b, label=lab) for b, lab in zip(hand.boxes, labels)]
-    return replace(hand, tiles=list(labels), boxes=boxes)
 
 
 class YoloDetector:
@@ -309,8 +274,8 @@ def _make_detector(weight: str | Path, *, imgsz, conf: float,
     - "onnx": 强制 ONNX(缺 .onnx 文件会抛错);
     - "torch": 强制 ultralytics/torch;
     - "auto"(默认): onnxruntime 可用且同名 .onnx 存在 -> ONNX, 否则 torch.
-      ONNX/DirectML 与 torch(CUDA) 实测逐框一致(见 tools/parity_check.py),
-      且运行时不再依赖 torch —— 依赖从 ~3GB 降到 ~300MB.
+      ONNX/DirectML 与 torch(CUDA) 验收时逐框一致, 且运行时不再依赖 torch ——
+      依赖从 ~3GB 降到 ~300MB.
     """
     import os
     choice = backend if backend != "auto" else os.environ.get(

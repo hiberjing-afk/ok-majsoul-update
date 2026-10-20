@@ -220,7 +220,7 @@ def outside_play(tiles, player_count: int = 3) -> list[str]:
 def has_win_signal(rows) -> bool:
     """这批候选里有没有"能赢"的信号.
 
-    全是 0 说明引擎这手牌给不出可用结论(`win`/`points` 都不动) —— 影子日志
+    全是 0 说明引擎这手牌给不出可用结论(`win`/`points` 都不动) —— 调用方
     应当如实标注, 否则会拿一个纯粹由牌名决定的"最优出牌"当真。
     """
     return any(row.win > 0.0 for row in rows or ())
@@ -382,7 +382,7 @@ def evaluate_discards(hand, *, melds=(), visible=None, draws: int = 8,
 
     差的那一个数量级全在"给每一种可能和牌的组合算役种/符/点数"上 —— 走的是
     jansou.scoring 的纯 Python 路径, 原生加速模块管不到. 主循环里同步跑
-    700ms 是有风险的(会吃掉思考倒计时), 所以影子的默认档不带打点.
+    700ms 是有风险的(会吃掉思考倒计时), 所以默认档不带打点.
 
     打点在排序里只做**平局裁决**(见函数尾部的长注释): 胡牌率/进张是主键,
     打点量级不参与方向判断. 生产档(`EV_EVAL_POINTS=False`)根本不算它 ——

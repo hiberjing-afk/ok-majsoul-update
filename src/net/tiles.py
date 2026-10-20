@@ -15,16 +15,10 @@ from src.mahjong.tiles import parse_tile
 # 数牌 0-9m/p/s(0 = 赤 5) + 字牌 1-7z(东南西北白发中)
 _TILE_RE = re.compile(r"^(?:[0-9][mps]|[1-7]z)$")
 
-RED_FIVES = frozenset({"0m", "0p", "0s"})
-
 
 def is_tile(text: object) -> bool:
     """协议里这个字符串是不是一张合法的牌?"""
     return isinstance(text, str) and bool(_TILE_RE.match(text))
-
-
-def is_red_five(text: str) -> bool:
-    return text in RED_FIVES
 
 
 def normalize(text: str) -> str:

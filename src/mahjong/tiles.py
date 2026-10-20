@@ -108,35 +108,11 @@ def is_out_of_play(tile: str, player_count: int = 3) -> bool:
     return kind[1] == "m" and 2 <= int(kind[0]) <= 8
 
 
-def out_of_play_indices(tiles: list[str], player_count: int = 3) -> list[int]:
-    """返回"这局不可能的牌"在 `tiles` 里的**下标**(去重, 保持原顺序).
-
-    为什么要下标而不是牌名(2026-10-06 实跑踩出来的):
-    `tiles_out_of_play()` 只返回牌名, 上层拿它只能"整轮停手". 但**一张牌被
-    认错并不等于整个局面没救** -- 真实场景是手牌 13 张里错 1 张(实测 8s 被认成
-    4m, conf=0.871 还不低), 而 robust_discard 恰恰就是为"某几张牌认不准"设计的:
-    枚举这些槽位的真实取值, 挑一张怎么认都不会踩坑的打.
-    之前的问题 robust_discard 只在 blurry_indices(低置信槽位) 非空时触发, 而
-    **"出现不可能的牌"是另一条独立的信号, 没接进去** -- 于是一张错牌把整局
-    卡成永久 wait(23:21 实跑 70 轮一张牌没打).
-    所以这里必须返回下标, 让调用方把它并进待纠正集合.
-    """
-    if player_count == 4:
-        return []
-    seen: set[int] = set()
-    for i, tile in enumerate(tiles):
-        if is_out_of_play(tile, player_count):
-            seen.add(i)
-    return sorted(seen)
-
-
 def tiles_out_of_play(tiles: list[str], player_count: int = 3) -> list[str]:
     """返回这局里根本不存在的牌(用来抓识别错误, 报错文案用).
 
     三人麻将去掉 2m-8m, 所以认出 "2m" 一定是识别错了(或用了四人的模板).
     四人麻将返回空列表.
-
-    要拿下标去纠正误识请用 `out_of_play_indices()`.
     """
     return [parse_tile(t) for t in tiles if is_out_of_play(t, player_count)]
 

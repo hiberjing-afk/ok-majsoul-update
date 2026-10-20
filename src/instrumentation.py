@@ -18,12 +18,11 @@
     inferences.csv  每次模型推理一行: name, t_s, ms
     summary.json    汇总: 频率、P50/P95/P99、阶段分布、CPU/GPU 统计
 
-阶段(phase)的语义(由 PlayOneGameTask 主循环在每次读手牌前设置):
-    active        出牌阶段: 发牌闸门已开(DealWatch.opened)且不在和了封锁
-    deal_pending  非出牌阶段: 发牌中/换手后闸门未开
-    settling      非出牌阶段: 和了封锁期(等摊牌/结算)
-    gave_up       非出牌阶段: 牌桌特征失灵超过 TABLE_WAIT_LIMIT 后退回旧行为
-    unknown       读手牌发生在任务上下文之外(如预热)
+阶段(phase)的语义(调用方按需 `set_phase`, 默认 unknown):
+    active        出牌阶段
+    deal_pending  发牌/换手后的等待阶段
+    settling      和了/流局的结算阶段
+    unknown       未标注(任务上下文之外, 如预热)
 
 CPU 采样用 psutil(系统 + 本进程); GPU 用 pynvml(NVML, 0 号卡整机占用,
 不区分进程 —— DirectML 推理不会体现在进程级指标里, 只能看整机).

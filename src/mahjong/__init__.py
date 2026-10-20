@@ -1,9 +1,11 @@
 """对局内的麻将逻辑: 牌的记号 / 出牌决策 / 操作节奏.
 
-这一层**不碰截图也不碰点击**, 只回答"看到这副手牌该打哪张, 该等多久":
+这一层**不碰截图也不碰点击**:
 
     src/mahjong/tiles.py   牌记号与 jansou 之间的转换
-    src/mahjong/brain.py   出牌决策(jansou 算牌效 + 随机性注入)
+    src/mahjong/rules.py   役牌对子 / 赤 5 选槽 / 杠不拆搭等稳定规则
+    src/mahjong/brain.py   纯牌效出牌(jansou 算向听/进张 + 随机性注入)
+    src/mahjong/ev_eval.py 出牌 EV(牌河扣减 / 打点)
     src/mahjong/timing.py  操作耗时的随机分布
 
 这样切分是为了能离线单测 -- 决策错了最多打得臭, 认牌错了会打出错牌,

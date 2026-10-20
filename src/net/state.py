@@ -30,7 +30,7 @@
 
 与项目铁律对齐:
 - 任何事件解析失败都不抛: 记 protocol_suspect + unhandled 计数,
-  让上层决定回退视觉(宁可漏判不可锁死);
+  让上层告警并停手(宁可漏判不可锁死);
 - 事件按 step 去重(syncGame 重放会重复喂);
 - 牌张合法性用 net.tiles 校验, 不造第二套记号.
 """
@@ -39,13 +39,14 @@ from __future__ import annotations
 
 import base64
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import liqi
 from .liqi import LiqiMessage, MsgType, decode_nested_action
 from .tiles import is_tile, normalize
 
-# OptionalOperation.type -> 决策层按钮 key(与 src/mahjong/table.py 的常量对齐).
+# OptionalOperation.type -> 决策层按钮 key.
 # 数值口径(与 Akagi/MahjongCopilot 及牌谱内 operation_list.type 一致):
 #   他家打牌后给我的: 2=吃 3=碰 5=大明杠 9=荣和
 #   我摸牌后给自己的: 1=打牌 4=暗杠 6=加杠 7=立直 8=自摸 11=拔北(三麻)
@@ -53,22 +54,20 @@ from .tiles import is_tile, normalize
 OP_TYPE_TO_BUTTON = {
     2: "chi",       # 吃
     3: "peng",      # 碰
-    4: "gang",      # 暗杠(不破门清, 决策层单独判, 见 table.decide_turn 第 5 步)
+    4: "gang",      # 暗杠(不破门清, 由 engine.rules 单独判)
     5: "gang",      # 大明杠
     6: "gang",      # 加杠
     7: "lizhi",     # 立直
     8: "zimo",      # 自摸
     9: "he",        # 荣和
-    11: "babei",    # 拔北(三人麻将; 北在本项目不是手牌槽位, 见 table.py ACTION_BABEI)
+    11: "babei",    # 拔北(三人麻将; 北在本项目不是手牌槽位)
 }
 # 有吃碰杠/荣和机会时, "跳过"始终是可选项(雀魂一定给这个按钮)
 CALL_BUTTONS = frozenset({"chi", "peng", "gang", "he"})
 
 # OptionalOperation.type 里唯一的"不是按钮"的那一项: 1 = 打牌.
 # 它出现在 operation_list 里就表示**服务端在说"轮到你打牌了"** —— 这是"轮到我"
-# 的权威判据, 比视觉的"张数 % 3 == 2"硬(那个是从读出来的张数反推的, 漏认一张
-# 就推错; 见 table.is_my_discard_turn). 之所以过去没建模, 是因为它没有按钮框,
-# 只被当成"有个未知操作"跳过了.
+# 的权威判据: 它直接来自服务端, 不从画面张数反推.
 OP_TYPE_DISCARD = 1
 
 #: 只有这三种是"鸣"(别人打牌后给我的): 2=吃 3=碰 5=大明杠.
@@ -82,7 +81,7 @@ AAG_JIAGANG, AAG_ANGANG = 2, 3
 
 # 与日麻无关的动作(川麻换牌/定缺/血战、四川杠结果等)。它们必须被吃掉而不是
 # 当成"协议漂移": 一旦走 _unhandled 就把 protocol_suspect 置真 -> 上层判定
-# 桥不可用 -> 整局静默回退视觉, 而其实我们什么都没漏.
+# 桥不可用 -> 整局被误判成读不到协议, 而其实我们什么都没漏.
 BENIGN_ACTIONS = frozenset({
     "ActionUnveilTile",        # 揭示(三麻/川麻的公开)
     "ActionLockTile",          # 川麻定缺
@@ -161,7 +160,7 @@ class GameState:
     my_waits: list[str] = field(default_factory=list)   # 协议给我的听牌(有才给)
     last_liqi: dict | None = None   # 最近一次"立直成立"回执(LiQiSuccess 原样)
     # 最近一次**给自己发牌**(ActionDealTile 且是我的座位)的本地时刻.
-    # 摸到那张有渐入动画, 落定前读数低置信、reconcile 对不上、存帧全是
+    # 摸到那张有渐入动画, 落定前读数低置信、与协议对不上、存帧全是
     # 动画噪声(2026-10-17 4 张 lowconf 帧全是它). 只存原始事实, 等多久
     # 由消费方算, 与 offered_at 同一个口径.
     last_self_draw_at: float = 0.0
@@ -191,17 +190,31 @@ class GameState:
     protocol_suspect: bool = False
     unhandled: dict[str, int] = field(default_factory=dict)
     last_event: str = ""
+    #: 事件驱动内核的接缝: 每条**被消费的 Action** 应用完之后回调一次.
+    #:
+    #: 回调参数 = (action 名, data, step, 应用完之后的 GameState). 放在这里
+    #: 而不是让内核去轮询状态, 是为了保证"一个事件一个决策": ActionNewRound
+    #: 带 14 张(庄家)、ActionDealTile 摸牌、ActionDiscardTile 的鸣牌窗口,
+    #: 各自在**那一刻**看到的状态才是完整的一手, 批处理完再读会漏掉中间态.
+    #: None = 老任务不接线(状态机行为一字不变).
+    on_event: Callable[[str, dict, int, "GameState"], None] | None = field(
+        default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------ API
 
     def apply(self, msg: LiqiMessage) -> bool:
         """喂一条报文. 返回是否被消费(False = 忽略/重复)."""
         try:
-            return self._apply(msg)
+            consumed = self._apply(msg)
         except Exception:  # noqa: BLE001 - 状态机永不把异常抛给主循环
             self.protocol_suspect = True
             self.last_event = f"apply-failed: {msg.method} {msg.action or ''}"
             return False
+        if consumed and msg.action and self.on_event is not None:
+            # 引擎自己的异常不在上面那个 try 里吞: 状态机坏和决策坏是两回事,
+            # 决策坏了必须让调用方看见(引擎异常由 runner 停手).
+            self.on_event(msg.action, msg.data or {}, msg.step, self)
+        return consumed
 
     def concealed(self) -> int:
         return len(self.hand)
@@ -248,8 +261,7 @@ class GameState:
         """服务端明确说"轮到你打牌"没有(当前操作列表里有「打牌」).
 
         与 is_my_turn()(张数 % 3 == 2)是**两条独立判据**: 那个是从读出来的张数
-        反推的, 漏认一张就推错; 这个直接来自服务端. 影子档拿它俩对比, 量的就是
-        "视觉判的时机准不准"(见 tuning.NET_TURN_CLOCK).
+        反推的, 漏认一张就推错; 这个直接来自服务端.
         """
         return any(int(op.get("type", -1)) == OP_TYPE_DISCARD
                    for op in self.offered if isinstance(op, dict))
@@ -306,34 +318,11 @@ class GameState:
         return [s for s in self.riichi_seats()
                 if self.my_seat is None or s != self.my_seat]
 
-    def decide_inputs(self, *, meld_policy: str = "peng",
-                      allow_riichi: bool = True) -> dict:
-        """组装 src.mahjong.table.decide_turn 的入参.
-
-        网络读数没有"置信度"概念: 按钮一律 1.0, blurry/missing_slots 恒空.
-        注意手牌顺序是协议顺序, 不等于屏幕顺序 -- 点击坐标映射是接线期
-        的事(见 docs/ARCHITECTURE.md 第七节待办).
-        """
-        buttons = {key: 1.0 for key in self.offered_button_keys()}
-        return {
-            "tiles": list(self.hand),
-            "buttons": buttons,
-            "player_count": self.player_count,
-            "meld_policy": meld_policy,
-            "allow_riichi": allow_riichi,
-            "melded": self.melded_tiles(),
-            "blurry_indices": [],
-            "missing_slots": 0,
-            "blurry_draw": False,
-            "allowed_indices": None,
-            "button_centers": None,
-        }
-
     def snapshot(self) -> dict:
         """紧凑摘要(日志/演示用).
 
-        立直信息必须在这里露出来: 影子档只打 status/note, 决策层也只吃
-        decide_turn 的既有入参 -- 不露出来就等于"解析了但没人看得见".
+        复盘与日志都靠它: 协议解析出来的事实如果不露在这里, 就等于"解析了
+        但没人看得见".
         """
         return {
             "my_seat": self.my_seat,
@@ -491,8 +480,7 @@ class GameState:
         # 水位, 而"友人场 一局"每场都从**东一局 (0,0,0)** 开: 上一场打到 step 90
         # 收局, 这一场的 ActionNewRound(step=1) 被当成 syncGame 重放丢弃 -> 之后
         # 整场每条事件都 <= 90 全被吞 -> round_open 永远停在上一场的 False ->
-        # `decide_turn` 的收局守卫整场拒绝出牌(视觉手牌照常更新, 所以画面上
-        # 像"程序在发呆", 日志里每轮都是"协议说这一手已经结束").
+        # 内核整场拒绝出牌(画面上像"程序在发呆").
         # authGame 是"新一场"的权威信号; 断线重连也会重发它, 重置后紧跟的
         # syncGame 会从 step 0 重放整手事件, 状态重建结果一致(幂等).
         self.round_id = None
@@ -507,7 +495,7 @@ class GameState:
         tiles = data.get("tiles") or []
         if not all(is_tile(t) for t in tiles):
             self._suspect(f"new_round tiles invalid: {tiles!r}")
-            return      # 不拿垃圾污染手牌: 上层见 suspect 回退视觉
+            return      # 不拿垃圾污染手牌: 上层见 suspect 停手
         self.hand = list(tiles)
         # 庄家第一巡开局就是 14 张(配牌 13 + 第一摸, 一次给全), 但客户端**整手
         # 排序**, 摸的那张插进它的排序位, 不留独立槽(2026-10-18 18:56 局实锤:
@@ -647,7 +635,7 @@ class GameState:
         # 后面那个 `or 0` 根本拦不住, 于是"吃"被当成未建模动作 -> `_unhandled`
         # -> protocol_suspect 置真 -> **整手牌**的协议读数全废(复位要等下一局开局).
         # 2026-10-17 真机实测代价: 第二场東1局第 9 手别人一个吃, 那一手 111 轮
-        # 全程 net 空、纯视觉在打.
+        # 全程读不到协议, 这一手只能停手.
         type_ = int(data.get("type") or 0)
         tiles = [t for t in (data.get("tiles") or []) if is_tile(t)]
         froms = [int(f or 0) for f in (data.get("froms") or [])]
@@ -724,7 +712,7 @@ class GameState:
         """拔北(三人麻将): 从暗手抽掉一张北, 随后 ActionDealTile 补一张.
 
         拔北不算副露、不破门清, 所以只从暗手移除 + 计数, 不进 self.melds
-        (与 table.py 的 babei 语义一致: 北留在手里也能当役牌, 拔不拔由策略定).
+        (北留在手里也能当役牌, 拔不拔由 engine.rules 定).
         报文里没有 tile 字段 -- 三麻只有"北"(4z)可以拔.
         """
         seat = int(data.get("seat", 0) or 0)
@@ -783,7 +771,7 @@ class GameState:
         """与本项目规则无关的动作(川麻换牌/定缺/血战等): 只吃掉, 不动状态.
 
         走这里而不是 `_unhandled`, 是因为 `_unhandled` 会把 protocol_suspect
-        置真 -> 上层判定桥不可用 -> 整局静默回退视觉. 这些动作在日麻里不该
+        置真 -> 上层判定桥不可用 -> 整局停手. 这些动作在日麻里不该
         出现, 但万一出现也绝不能让它把整条链路判死.
         """
         if data:

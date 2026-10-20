@@ -49,8 +49,8 @@ SLOT_GAP_RATIO = 0.70
 #:
 #: 判据因此必须与**数量无关**: 只留框高 ≥ 最大框高这个比例的框。
 #: 副露(0.58)永远被剔, 手牌(1.0)永远保留, 副露多少组都一样。
-#: 暗杠的行尾竖牌是全尺寸的(高度同手牌), 不受影响, 仍由
-#: split_setaside(仅 _kan_pending 时)按大空档剥离。
+#: 暗杠的行尾竖牌是全尺寸的(高度同手牌), 不受影响; 它由任务层在
+#: "自己刚杠过"的状态下按大空档单独剥离.
 MELD_HEIGHT_RATIO = 0.75
 
 
@@ -211,21 +211,16 @@ def read_row(boxes: Iterable[Detection], **kwargs) -> list[Detection]:
     return best_per_slot(group_slots(filter_outliers(boxes, **kwargs)))
 
 
-def row_labels(boxes: Iterable[Detection], **kwargs) -> list[str]:
-    """read_row 之后只要类别名, 用来直接拼手牌."""
-    return [b.label for b in read_row(boxes, **kwargs)]
-
-
-#: 手牌行里, 相邻两张牌的正常间距是牌宽的多少倍.
+#: 手牌行里"漏认"的判据: 相邻两张间距达到牌宽的这么多倍, 那里就少了牌.
 #:
 #: 实测(2026-10-07, 真实对局帧逐帧量): 正常相邻间距在 **1.00~1.05** 倍之间
 #: 非常稳定(牌是等间距排的), 所以"少了一张"会留下一道 ≥2 倍的空档 --
 #: 1.5 这个门槛离两端都很远。
-SLOT_GAP_RATIO = 1.5
+MISSING_GAP_RATIO = 1.5
 
 #: 摸到的那张牌与手牌之间的固定间隔, 同样是牌宽的倍数.
 #:
-#: 实测 **2.37~2.39**(极稳), 也就是说它**本身就 ≥ SLOT_GAP_RATIO**, 必须
+#: 实测 **2.37~2.39**(极稳), 也就是说它**本身就 ≥ MISSING_GAP_RATIO**, 必须
 #: 单独减掉, 否则每一轮都会被误判成"少了一张"。这是这套判据唯一的坑。
 DRAWN_TILE_OFFSET = 1.4
 
@@ -264,7 +259,7 @@ def missing_slots(boxes: Sequence[Detection]) -> int:
         ratio = (right.x1 - left.x1) / pitch
         if index == last:
             ratio -= DRAWN_TILE_OFFSET        # 末尾是刚摸的牌, 间隔本来就大
-        if ratio < SLOT_GAP_RATIO:
+        if ratio < MISSING_GAP_RATIO:
             continue
         missing += max(1, int(round(ratio)) - 1)
     return missing
@@ -275,38 +270,6 @@ def missing_slots(boxes: Sequence[Detection]) -> int:
 #: 实测(2026-10-08 20:47 局 t340 帧): 暗杠的 4 张牌**竖着**摆在手牌行
 #: 最右端, 与暗牌之间的空档 ≈ 4.8 倍牌宽. 对照组: 相邻牌 1.00~1.05 倍,
 #: 摸切间隔 2.37~2.39 倍 —— 3.0 取在中间, 与两端都隔着一个量级.
-SETASIDE_GAP_RATIO = 3.0
-
-
-def split_setaside(boxes: Sequence[Detection],
-                   min_ratio: float = SETASIDE_GAP_RATIO,
-                   ) -> tuple[list[Detection], list[Detection]]:
-    """把手牌行按**最后一道大空档**切成 (主体, 行尾副牌区).
-
-    为什么需要(2026-10-08 20:47 局实锤): 自己暗杠后, 雀魂把 4 张杠牌竖着
-    摆在手牌行最右端, 牌面模型把它们当成手牌一起读进来 —— 11 张 + 空档 6,
-    张数、间距、出牌定位全被带歪(死锁一整手的根因). 吃/碰的副露是**横牌**,
-    模型天然不认, 唯独暗杠竖牌混得进来.
-
-    用法: 只在**我们自己刚点过杠**的状态(kan_pending)下调用, 丢弃第二段.
-    大空档只认 ≥ min_ratio 倍牌宽的 —— 摸切间隔(2.4)挤不进来, 所以刚摸
-    的牌留在主体里; 主体内部的漏认空档(1.5~2.5)也不会误切.
-
-    返回 (主体框列表, 行尾副牌框列表); 没有大空档时副牌区为空.
-    """
-    if len(boxes) < 2:
-        return list(boxes), []
-    ordered = sorted(boxes, key=lambda b: b.x1)
-    pitch = median([b.x2 - b.x1 for b in ordered])
-    if pitch <= 0:
-        return list(boxes), []
-    cut = None
-    for index, (left, right) in enumerate(zip(ordered, ordered[1:])):
-        if (right.x1 - left.x1) / pitch >= min_ratio:
-            cut = index + 1
-    if cut is None:
-        return list(boxes), []
-    return ordered[:cut], ordered[cut:]
 
 
 def group_by_label(boxes: Iterable[Detection]) -> dict[str, list[Detection]]:
@@ -317,20 +280,6 @@ def group_by_label(boxes: Iterable[Detection]) -> dict[str, list[Detection]]:
     for items in groups.values():
         items.sort(key=lambda b: b.conf, reverse=True)
     return groups
-
-
-def pick(boxes: Iterable[Detection], label: str,
-         min_conf: float = 0.0) -> Detection | None:
-    """取某个类别里置信度最高的框; 没有或置信度不够返回 None."""
-    best: Detection | None = None
-    for box in boxes:
-        if box.label != label:
-            continue
-        if box.conf < min_conf:
-            continue
-        if best is None or box.conf > best.conf:
-            best = box
-    return best
 
 
 def region_pixels(width: int, height: int,
@@ -347,167 +296,3 @@ def region_pixels(width: int, height: int,
     if y1 <= y0 or x1 <= x0:
         return (0, height, 0, width)
     return (y0, y1, x0, x1)
-
-
-# ------------------------------------------------- 立直宣言牌: 按高亮/变暗认
-#
-# **2026-10-06 重要更正(用户纠正 + 实跑日志复核)**:
-# 之前这里写的是"立直后雀魂把宣言牌单独渲染得更矮(118px vs 132px)并放到
-# 分离位", 据此写了 is_declaration(). 那个结论是**错的**, 两处都错:
-#
-# 1) "更矮" 测到的其实是**刚摸到的那张牌**. 复核 t76~t83 的真实框坐标:
-#    t77(点立直那轮) 末位 3p 的 h=118, t78 起变成 h=128~129, 与其余牌同高.
-#    也就是说 118px 是"刚摸的牌"的渲染样式, 立直与否都会出现, 且**只出现
-#    那一轮** -- 拿它当宣言牌判据, 恰好在真正需要判宣言牌的时候不成立.
-#
-# 2) "分离位左边距" 同理. 之前记的"13 张时末位左边距 188~190px"是错的,
-#    真实值是 96px(比值 1.01~1.03, 即**没有**分离). 那个 188~190 来自
-#    统计脚本取了 max(gaps) 而不是 gaps[-1], 把中间某个异常值当成了末位.
-#
-# **真正的机理(用户指出, 与日志一致)**: 点下立直后雀魂进入"选牌"状态,
-# **能打的牌高亮, 其余变暗**; 此时点任意一张高亮的牌即完成立直宣言.
-# 日志佐证: t78~t82 每轮 buttons=[] -- 如果真锁定了必须打宣言牌, 一定会
-# 出现确认/跳过按钮, 但没有. 而 t83 打出 2p 后手牌 14->13 成功, 且手牌
-# 变成**已排序**(2p3p4p5p6p7p...), 那才是宣言成功的一刻.
-# 换句话说 t78~t82 点不进去, 是因为点在**变暗**的牌上, 雀魂不响应.
-#
-# 所以判据换成: 找出**高亮**的那些牌, 而不是找"哪张长得特殊".
-# 高亮牌通常不止一张(任何能组成立直的牌都可以选), 选哪张由牌效决定 --
-# 立直宣言牌是"我们打出去的那张", 不是"游戏指定的那张".
-
-
-def tile_brightness(frame, box, inset: float = 0.0) -> float | None:
-    """取一个框内部的平均亮度(0~255); 裁不出来返回 None.
-
-    只看牌面中央那块: 牌的边缘有描边和阴影, 立直栏(拿出来的牌)会盖住
-    一部分, 边缘像素会把"变暗"稀释掉. inset 是四边各缩进的比例.
-    """
-    h = frame.shape[0]
-    w = frame.shape[1]
-    bh, bw = box.height, box.width
-    if bh <= 0 or bw <= 0:
-        return None
-    dx, dy = bw * inset, bh * inset
-    x1, y1 = int(box.x1 + dx), int(box.y1 + dy)
-    x2, y2 = int(box.x2 - dx), int(box.y2 - dy)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    patch = frame[y1:y2, x1:x2]
-    if patch is None or patch.size == 0:
-        return None
-    # 转灰度: 高亮/变暗是**亮度**变化, 与色相无关. 用 numpy 避开
-    # 逐像素循环(14 张牌每帧都调, 不能慢).
-    gray = patch[..., 0] * 0.299 + patch[..., 1] * 0.587 + patch[..., 2] * 0.114
-    return float(gray.mean())
-
-
-# 高亮组与变暗组之间的最小亮度差. 小于这个差就认为"没有明显分组"(不在
-# 选牌态). 实测标定见 tests/TestDetection.py::TestBrightSplit, 改这个数
-# 之前必须带负样本验: 正常对局(所有牌一样亮)绝不能被分成两组.
-BRIGHT_GAP = 12.0
-
-
-def split_bright_dim(boxes: Sequence[Detection], brightness: Sequence[float],
-                     gap: float = BRIGHT_GAP) -> tuple[list[int], list[int]]:
-    """把手牌分成"高亮"和"变暗"两组, 返回两组的下标.
-
-    **做法: 在"最大亮度间隙"处切开, 而不是拿中位数加固定偏移.**
-    后者有个隐蔽的失效场景: 高亮牌占多数时中位数落在亮组, 于是
-    "中位数 + gap" 把整组都排除, 分组直接崩掉(实测 11 亮 3 暗 ->
-    两组全空). 而"最大间隙"对哪一组是多数都成立: 它只看相邻亮度值之间
-    落差最大的那个位置, 正好就是亮暗之间的那道坎.
-
-    排序后找到相邻亮度落差最大的下标 k. order 是**升序**, 所以亮牌在
-    order[k+1:] 那一侧, 暗牌在 order[:k+1]. 落差不够 gap 就返回两个空组
-    -- 调用方据此判定"不在选牌态".
-
-    返回的下标按**原始位置**升序(不是亮度顺序), 因为调用方拿它当点击
-    候选集用, 顺序不该携带"谁更亮"的额外含义.
-    """
-    n = len(brightness)
-    if n < 3:
-        return [], list(range(n))
-    order = sorted(range(n), key=lambda i: brightness[i])
-    values = [brightness[i] for i in order]
-    best_k, best_drop = -1, 0.0
-    for k in range(n - 1):
-        drop = values[k + 1] - values[k]
-        if drop > best_drop:
-            best_drop, best_k = drop, k
-    if best_k < 0 or best_drop < gap:
-        return [], []
-    return sorted(order[best_k + 1:]), sorted(order[:best_k + 1])
-
-
-# ------------------------------------------------------- 低置信度闸门
-
-
-# 低于这个置信度的牌算"没认准".
-#
-# **这个阈值仍按"盖住全部已证实误识"来定, 2026-10-07 用新配置重测过, 结论是
-# 保持 0.78 不动。**
-#
-# 原来 0.78 的来历(2026-10-06 那一局, 456 帧有手牌的帧): 把"已证实误识"
-# (出牌后手牌张数掉超过 1 张, 见 PlayOneGameTask._discard)的 6 轮挑出来,
-# 它们每轮**最低**一张牌的置信度是 0.42/0.42/0.43/0.46/0.66/0.74 -- 全部
-# ≤0.74. 而最低置信度 ≥0.80 的 4 轮(turn 83/106/111/121)**没有一个是误识**.
-#
-# 那批数据是在牌面被压到 **49px** 的 TILE_IMGSZ=(224,1024) 下采的, 整手牌
-# conf 中位数只有 0.482 -- 也就是"0.78"曾是在一个整体偏低的分布上划的线.
-# 怀疑过它在新配置下会偏严, 所以 2026-10-07 拿 192 张对局帧(2601 张牌)重测,
-# 当前 TILE_IMGSZ=(256,1024):
-#
-#   conf 中位 0.926      最低 0.152
-#   <0.30  3.5%   [0.3,0.5) 5.3%   [0.5,0.6) 3.5%   [0.6,0.7) 2.3%
-#   [0.7,0.8) 4.2%   [0.8,0.9) 17.6%   >=0.90 63.6%
-#
-# 分布是**两头重中间轻**: 63.6% 落在 ≥0.90(认得很准), 另有 8.8% 掉在 <0.50
-# (基本可以断定认错). 0.78 正好切在中间那段"说不清"的少数派上, 平均每帧
-# 只有 2.18/13.5 张落在它下面 —— 也就是"偶尔要谨慎一下", 不是"每轮都在猜".
-# 拿它当闸门是合适的, 所以**不改**.
-#
-# 为什么不放宽: 已证实误识里最高的那张是 0.74, 阈值一旦降到 0.70 就盖不住
-# 它了 -- 而"盖住全部已证实误识"是目前唯一有证据支撑的判据. 拿"少触发几次
-# 稳健出牌"(只是多花 20~170ms)去换"漏掉一个已证实的误识"(结果是打错牌),
-# 这笔账始终不划算.
-#
-# 注意这不是"低于它的牌一定认错", 而是"低于它的槽位不能全信". 这些槽位
-# 会喂给稳健出牌(见 src/mahjong/brain.py::robust_discard): 枚举它们可能的真实
-# 取值, 挑一张怎么认都不踩坑的牌打. 另外三麻里"这局不存在的牌"(2m-8m)是
-# **独立于置信度**的第二类误识信号, 见 src/mahjong/tiles.py::out_of_play_indices.
-#
-# 踩过的坑: 早先想的是"低置信就整轮不出牌, 等下一帧认准", 数据上已证伪并
-# 删掉 -- 位置 4 在 turn 176~185 连续 10 轮输出同一个错类别, conf 稳定在
-# 0.64~0.67, 等多久都不恢复; 那样会有 73% 的时间在空等, 节奏全拖垮. 更关键
-# 的是误识牌从不被直接点(6 个已证实误识里只有 1 个点了低置信那张), 真正的
-# 危害是它污染了"哪张该打"的全局判断 -- 防护必须做在决策层, 不是点击层.
-MIN_TILE_CONF = 0.78
-
-
-def low_confidence(boxes: Sequence[Detection],
-                   threshold: float = MIN_TILE_CONF) -> list[int]:
-    """返回置信度低于阈值的槽位下标(升序); 全部达标返回空表.
-
-    **这个闸门是为了防"牌效算错"这件事, 不是为了防"认不出画面".**
-
-    误识本身是静默的: 牌面模型认错了牌, 画面上什么异常都看不出来, 系统
-    会**认真**拿这手错牌去算牌效, 然后精确地打出一张"最优但根本不存在
-    在屏幕上"的牌. 实跑的现场(turn 185): 真手牌是 789p, 模型把第二张 7p
-    读成了 7p(conf 0.66), 于是"789p"变成"779p" -- 9p 成了孤张, 牌效
-    算出"打 9p 最优"(向听1 进张7), 打出去直接退向. 而真实手牌下最优是
-    打 3z(向听1 进张21). 日志里 25 轮出牌回放, 22 轮与复算完全一致,
-    3 轮差异都能被"次优/随机"档位解释 -- **决策层可复现, 错的是输入**.
-
-    与协议对账互补: 对账(net.assist.reconcile_hand)在协议可用时把标签整体
-    换成协议真值; 而这里认错的那张牌可能**连续十几帧都稳定地认成同一个错
-    类别**(实测位置 4 有 18/19/17 帧的连续低置信段), 协议张数对不上或桥
-    不可用时对账不出手, 只能把低置信槽位交给决策层的稳健出牌(枚举可能
-    取值, 挑一张怎么认都不踩坑的).
-
-    早先的方案是"低置信就整轮不出牌, 等下一帧认准", 已经被数据证伪并删掉,
-    原因见上面 MIN_TILE_CONF 那段注释(等不回来 + 73% 时间空等 + 误识牌从不被
-    直接点). 这里的定位是**筛出不可信的槽位**喂给稳健出牌, 不是拦住这一轮.
-    """
-    return [i for i, b in enumerate(boxes) if b.conf < threshold]
