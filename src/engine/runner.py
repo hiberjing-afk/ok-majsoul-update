@@ -74,6 +74,7 @@ class EngineRunner:
         self._button_since = 0.0
         self._lizhi_done: tuple | None = None
         self._delayed_key: tuple | None = None
+        self._poll_error: str | None = None
 
     def run(self) -> bool:
         """跑完一局. True = 正常回到准备页/结算页/整场结束."""
@@ -106,9 +107,23 @@ class EngineRunner:
 
             try:
                 self.net.poll()
-            except Exception as exc:  # noqa: BLE001 - 引擎异常必须停手, 不能带病点击
-                self.hooks.log(f"  [engine] 协议事件处理异常: {exc}")
-                return False
+                self._poll_error = None
+            except Exception as exc:  # noqa: BLE001 - 一条坏事件不能打掉整场
+                # 决策层抛异常 = 这一轮的牌没算出来, 丢掉这一条决策就行: 雀魂
+                # 倒计时到点会自动摸切, 下一个事件到来时状态已经翻页, 很可能
+                # 就正常了(2026-10-21 00:53 一条 ValueError 停掉了整场).
+                # 同一条错误只报一次, 免得每 0.2s 刷屏; poll 成功一次后复位.
+                message = str(exc)
+                if message != self._poll_error:
+                    self._poll_error = message
+                    self.hooks.log(
+                        f"  [engine] 协议事件处理异常（丢掉这一轮，继续打）: {message}")
+                self.controller.pop_pending()
+                retry = None
+                if getattr(getattr(self.net, "state", None), "game_over", False):
+                    return True
+                self.hooks.sleep(POLL_INTERVAL)
+                continue
             state = getattr(self.net, "state", None)
             if getattr(state, "protocol_suspect", False):
                 self.hooks.log("  [engine] 协议出现未建模动作，停手（不盲打）")
@@ -119,6 +134,10 @@ class EngineRunner:
                 # 会把「和/鸣/拔」重置回关). 不能等到"第一个决策"才复位 ——
                 # 非庄家开局可能整手都没有决策, 开关就一直是上一手的状态.
                 self.hooks.new_round(frame)
+                # 上一手没执行完的决策不能带过来: 牌已经换了一副, 照着旧决策
+                # 点下去就是乱点(实测会把上一手的立直重放进新一手).
+                retry = None
+                self._clear_exec_state()
             pending = self.controller.pop_pending()
             if pending:
                 retry = (pending[-1], time.time())   # 新决策覆盖旧的重试
@@ -126,6 +145,7 @@ class EngineRunner:
                 ok, why = self._execute(retry[0], frame)
                 if ok:
                     retry = None
+                    self._clear_exec_state()
                 elif time.time() - retry[1] >= EXECUTE_RETRY_SECONDS:
                     self.hooks.log(
                         f"  [engine] 执行 {retry[0].action} 失败（{why}），"
@@ -139,6 +159,19 @@ class EngineRunner:
         return False
 
     # ------------------------------------------------------------- execution
+
+    def _clear_exec_state(self) -> None:
+        """一条决策执行完之后, 清掉"这一步已经做过"的标记.
+
+        这些标记唯一的作用是**重试时别重复点击**(立直按钮只点一次), 所以
+        作用域是一次决策, 不是整场。以前从不清: 同一场里两次立直的
+        (action, tile, tiles) 恰好一样时, 第二次会以为按钮点过了, 只点手牌
+        ——立直就没立成(2026-10-21 01:33 实跑, 两次都是 `riichi 9s ['9s']`)。
+        新一手和"执行成功"两个点都要清: 前者防跨手串味, 后者防这一手内出现
+        第二次同 key 的立直。
+        """
+        self._lizhi_done = None
+        self._delayed_key = None
 
     # -------------------------------------------------------------- stability
 

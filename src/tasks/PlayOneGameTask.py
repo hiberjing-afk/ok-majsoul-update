@@ -17,15 +17,16 @@ from __future__ import annotations
 **前台**: ok-script 的 executor 在游戏不在前台时会整个挂起, 所以拉前台做在
 交互层 src/interactions.py 的 should_capture 里, 不需要手动点回游戏.
 
-配置: configs/PlayOneGameTask.json。界面只保留用户旋钮:
-    mode                     段位场(默认) / 友人场
-    players / length         友人场房型
+配置: 见两个子类(段位场 / 友人场)各自的 configs/*.json。界面只保留用户旋钮:
     max_games                连打几局(0 = 只建房不开始)
+    shutdown_after           打满指定局数后关机
+  段位场另有 tier / game, 友人场另有 players / length(见子类的 _default_config).
 其余阈值与延迟全部在 `src/tasks/tuning.py`.
 """
 
 import json
 import random
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,11 +38,17 @@ from src.mahjong import timing
 from src.net.assist import NetAssist
 from src.paths import DEBUG_ARTIFACTS_DIR
 from src.retention import prune_turn_frames
-from src.rooms import RoomSpec, ready_marker, required_categories, spec_by_key, start_step
+from src.rooms import (
+    RANKED_LOCKED,
+    RoomSpec,
+    ready_marker,
+    required_categories,
+    spec_by_key,
+    start_step,
+)
 from src.tasks import tuning
-from src.tasks.CreateFriendsRoomTask import _DEFAULT_CONFIG as _BASE_CONFIG
 from src.tasks.CreateFriendsRoomTask import CreateFriendsRoomTask, TaskStopped
-from src.vision import is_toggle_green
+from src.vision import is_toggle_green, page_changed
 
 # 结算页(对局结束的点数结算). 页面名与区域名对应
 # ok_templates/coco_annotations.json 里的 "结算页/终局" 与 "结算页/确认".
@@ -49,6 +56,25 @@ from src.vision import is_toggle_green
 RESULT_SCREEN = "结算页"
 RESULT_FEATURE = "终局"# 只用来探测"是不是结算页"
 RESULT_CONFIRM = "确认"    # 点它回到准备页
+
+# 终局那一串页面里的「获得奖励」(段位场打满几局后偶发, 不是必现).
+#
+# 为什么必须给它自己的标注(2026-10-21 实跑卡死 60s 的成因): 这一页也画着
+# 「终局」标题, 但那两个字压在立绘上, 而 「结算页/终局」模板是从 result.png
+# 的深色背景上裁的 —— 实测同一帧上 结算页/终局 只有 **0.654**(奖励页自己的
+# 截图 reward.png 上更低, 0.652), 阈值 0.88 根本进不来; 「确认」按钮这一页
+# 没有(0.199). 而 「奖励页/获得奖励」自匹配 1.000、全帧次峰 0.26。
+# 所以判页只能靠它自己的标题, 别再用别的页的标题去猜。
+REWARD_SCREEN = "奖励页"
+REWARD_FEATURE = "获得奖励"
+
+# 终局之后可能出现的所有页面特征(每页用**自己**的特征, 见上).
+# 一个来源: 检测(判页)与启动期"缺标注"告警都读这一张表.
+RESULT_PAGE_FEATURES: tuple[tuple[str, str], ...] = (
+    (RESULT_SCREEN, RESULT_FEATURE),
+    (RESULT_SCREEN, RESULT_CONFIRM),
+    (REWARD_SCREEN, REWARD_FEATURE),
+)
 
 # 对局中的画面特征: "牌桌已经画出来了". 对应 COCO 里的 "牌桌页/操作条".
 #
@@ -89,46 +115,45 @@ TABLE_FEATURE = "操作条"
 HAND_RESULT_SCREEN = "牌局页"
 HAND_RESULT_CONFIRM = "局确认"
 
-# ---- 场次: 段位场(主任务, 循环连打) / 友人场(测试用) ----
-# 段位场流程与友人场形状不同(无准备页/无开始按钮, 点"四人东"自动匹配开局),
-# 见 rooms.RoomSpec.ranked 的说明.
-MODE_RANKED = "段位场"
-MODE_FRIENDS = "友人场"
-MODE_OPTIONS = (MODE_RANKED, MODE_FRIENDS)
+# ---- 场次: 段位场(主任务) / 友人场(测试用) ----
+# 2026-10-25 用户要求把两者拆成两张任务卡(段位场要选 段位 x 对局, 友人场要选
+# 人数 x 时长, 两套选项毫不相干, 挤在一个下拉框里只会互相干扰). 本类退成
+# **公共基类**, 不再注册成任务卡片:
+#
+#   PlayRankedTask  段位场: tier(银之间/金之间) x game(四人东/四人南/三人东/三人南)
+#   PlayFriendsTask 友人场: players(三人/四人) x length(一局/东风局)
+#
+# 两条流程形状不同的地方在 rooms.RoomSpec.ranked, 与这里无关.
 
 
-
-# 在开房任务的默认配置之上, 加对局内需要的参数
+# 基类的默认配置: 只放"两种场次都要"的旋钮. 子类在上面叠加自己的房型选项.
 _DEFAULT_CONFIG = {
-    **_BASE_CONFIG,
-    # 场次下拉框: 段位场 = 银之间四人东自动匹配(主任务); 友人场 = 按下面的
-    # 人数/时长建房加电脑(测试用). 选了段位场时 players/length 两个下拉框
-    # 不参与建房; 牌桌页标注与自动开关行位一律按 RoomSpec.player_count 判
-    # (见 _players_key), 与下拉框无关.
-    "mode": MODE_RANKED,
-    # 房型沿用开房任务的两个下拉框(players + length), 不在这里重复设默认值.
-    # 原因: 打牌任务内部会调 CreateFriendsRoomTask 去建房, 两边必须选同一个
-    # 房型, 而下拉框的默认值来自 _BASE_CONFIG -- 只改一边的默认值会导致
-    # "界面选四人但打牌任务按三人建房"这种极难查的错位.
-    #
-    # **这里只放用户真正常用的**(2026-10-07 用户决定), 其余二十多项
+    # 连打几局. **这里只放用户真正常用的**(2026-10-07 用户决定), 其余二十多项
     # 内部调参全搬去了 src/tasks/tuning.py -- 框架会把 default_config 里
     # 每一项都渲染成控件, 塞满阈值/延迟只会让卡片没法看.
-    "max_games": 1,                 # 连打几局
+    "max_games": 1,
+    # 打满指定局数后关机(2026-10-25 用户要求). 只在**正常打满**时触发,
+    # 中途报错/用户喊停都不会关 —— 否则调试时天天被关机.
+    "shutdown_after": False,
+}
+
+#: 关机配置项的中文说明(框架会把 config_description 显示在配置项旁边).
+_CONFIG_DESCRIPTIONS = {
+    "max_games": "连打几局（0 = 只建房不开始）",
+    "shutdown_after": "打满指定局数后关机（60 秒缓冲，可 shutdown /a 取消）",
 }
 
 
 class PlayOneGameTask(CreateFriendsRoomTask):
-    """建房 -> 点开始 -> 打完一局(可连打)."""
+    """建房 -> 点开始 -> 打完一局(可连打). **基类, 不直接注册成任务.**
+
+    两个子类只差"开什么房"(见模块说明), 流程/内核/收尾全在这里.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.name = "自动打牌（段位场/友人场）"
-        self.description = ("段位场(默认): 银之间四人东自动匹配、循环连打; "
-                            "友人场(测试): 建房加电脑按牌效打")
-        # config_type(房型两个下拉框)从 CreateFriendsRoomTask 继承下来,
-        # 不重复声明 -- 父子两个任务卡片上的下拉框必须一致, 否则会出现
-        # "建房选四人, 打牌按三人" 的错位. 见 _DEFAULT_CONFIG 的说明.
+        self.name = "自动打牌"
+        self.description = "打牌流程基类（请用段位场 / 友人场任务）"
         self._vision: GameVision | None = None
         self._record_path: Path | None = None
         self._net: NetAssist | None = None        # 网络读牌对账门面
@@ -142,12 +167,9 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         # 那份(不含本类的对局内参数), 甚至可能是空 dict 导致整个卡片不展开.
         # 见 CreateFriendsRoomTask._init_default_config 的说明.
         self._init_default_config()
-        # 场次下拉框: 在继承的 players/length/room 之上加一个 mode.
-        # 默认值必须与 _DEFAULT_CONFIG["mode"] 及 MODE_OPTIONS 逐字一致
-        # (否则下拉框显示空白, 见 CreateFriendsRoomTask.__init__ 的说明).
+        self.config_description = dict(_CONFIG_DESCRIPTIONS)
+        # 子类在 super().__init__() 之后覆写 config_type 添加自己的房型下拉框.
         self.config_type = {
-            **self.config_type,
-            "mode": {"type": "drop_down", "options": list(MODE_OPTIONS)},
             # 连打局数上下限: 不声明时框架默认上限 99999999, 一旦进去一个
             # 千万级误值, 箭头点不到头、框里的数也几乎没法选中改写
             # (2026-10-11 实测踩坑, 配置里出现过 11212218).
@@ -158,30 +180,26 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         return dict(_DEFAULT_CONFIG)
 
     def _resolve_spec(self, cfg: dict) -> RoomSpec:
-        """按配置算出要开什么房间(覆写: 加了段位场 mode).
+        """按配置算出要开什么房间. **子类必须实现**(各自有一套选项).
 
-        显式 room 字段仍然最优先(命令行批量跑用); mode="段位场"(默认)
-        固定 RANKED_SILVER_4P, players/length 两个下拉框不参与;
-        mode="友人场" 走基类的组合推导.
+        显式的 room 字段仍然最优先(命令行批量跑用).
         """
-        if cfg.get("room"):
-            return spec_by_key(cfg["room"])
-        if cfg.get("mode") == MODE_RANKED:
-            return spec_by_key("ranked_silver_4p")
-        # 不写 super(): 测试把未绑定方法绑到 SimpleNamespace 上, super()
-        # 在那种 self 上走不了 MRO; 显式按类调用对两种 self 都成立.
-        return CreateFriendsRoomTask._resolve_spec(self, cfg)
+        room = cfg.get("room")
+        if room:
+            return spec_by_key(room)
+        raise NotImplementedError(
+            f"{type(self).__name__} 没有指定房间规格（子类必须实现 _resolve_spec）")
 
     def _players_key(self, cfg: dict) -> str:
         """牌桌页标注 / 自动开关行位按哪套"人数"取.
 
-        段位场模式下 players 下拉框不参与建房, 人数以 RoomSpec 为准
-        (ranked_silver_4p 是四人); 友人场沿用下拉框. _spec 用 getattr
-        兜底: 测试注入的 stub 不一定带这个属性.
+        人数以 RoomSpec 为准(段位场由对局名推出来, 与任何下拉框无关;
+        友人场由 players 下拉框组合成规格). _spec 用 getattr 兜底:
+        测试注入的 stub 不一定带这个属性.
         """
         spec = getattr(self, "_spec", None)
-        if spec is not None and getattr(spec, "player_count", None) == 4:
-            return "四人"
+        if spec is not None:
+            return "四人" if spec.player_count == 4 else "三人"
         return cfg.get("players") or ""
 
     # ---------------------------------------------------------------
@@ -201,7 +219,20 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         spec = self._resolve_spec(cfg)
         missing = self._missing_annotations(spec)
         if missing:
-            raise RuntimeError(f"房间 '{spec.label}' 缺标注: {missing}")
+            # 指路那句是给**老用户**的: 启动器渠道的素材只在首次安装时下载
+            # (update 仓库是公开的, 截图不能带, 见 docs/RELEASE.md), 升级代码
+            # 不会自动换模板 -> 选了新加的场次就在这里撞墙.
+            raise RuntimeError(
+                f"房间 '{spec.label}' 缺标注: {missing}\n"
+                f"如果这一档是最近才加的, 那是本地素材还是旧的: "
+                f"运行 python -m src.update --apply 更新后重试。")
+        missing_result = self._missing_result_features()
+        if missing_result:
+            self.log_warning(
+                f"终局页面特征缺标注: {missing_result} —— 打牌不受影响, "
+                f"但弹到这一页会点不掉（见 src/tasks/PlayOneGameTask.py 里 "
+                f"RESULT_PAGE_FEATURES 的说明）")
+        self._warn_optional_annotations(spec)
 
         # 先修剪上一批留下的每轮诊断帧, 再开始记这一批(见 _prune_debug_frames)。
         self._prune_debug_frames()
@@ -212,7 +243,31 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         # 段位场点完"四人东"就自动匹配, 分钟级的匹配期也要读协议(2026-10-17
         # 用户拍板"提前到任务开始"). 本方法只管打; 停止由 `_after_room_flow`
         # 的 finally 兜底(停止指令/异常退出都会关掉自己起的进程).
-        self._run_games(cfg, spec)
+        completed = self._run_games(cfg, spec)
+        self._shutdown_after_task(cfg, completed)
+
+    def _shutdown_after_task(self, cfg: dict, completed: bool) -> None:
+        """打满指定局数后关机(用户 2026-10-25 要的选项).
+
+        **只有正常打满才关**: 中途出错、匹配超时、用户点停止都不关 —— 否则
+        白天调试时每挂一次就被关一次机.
+        """
+        if not cfg.get("shutdown_after"):
+            return
+        if not completed:
+            self.log_info("任务没有正常打满局数，按约定不关机")
+            return
+        # 留一分钟缓冲: 这是整台机器, 误配一次代价太大.
+        self.log_warning(
+            f"{tuning.SHUTDOWN_DELAY}s 后关机（想取消: shutdown /a）")
+        try:
+            subprocess.run(
+                ["shutdown", "/s", "/t", str(tuning.SHUTDOWN_DELAY),
+                 "/c", "ok-majsoul 任务已完成，即将关机"],
+                check=False, timeout=10,
+            )
+        except Exception as e:  # noqa: BLE001 - 关不掉只影响收尾, 别打断任务日志
+            self.log_error(f"执行关机命令失败: {e}")
 
     def _before_room_flow(self, cfg: dict) -> None:
         """任务一开始(点四人东之前)就起抓包. 覆写基类钩子."""
@@ -223,8 +278,12 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         """房间流程收尾(覆写基类钩子): 关掉自己起的抓包进程."""
         self._stop_capture()
 
-    def _run_games(self, cfg: dict, spec) -> None:
-        """连打循环(段位场 / 友人场两路). 抓包在上层已经起好."""
+    def _run_games(self, cfg: dict, spec) -> bool:
+        """连打循环(段位场 / 友人场两路). 抓包在上层已经起好.
+
+        返回**是否正常打满了 cfg["max_games"] 局**(中途出错/用户喊停 -> False),
+        只有 True 才会触发"完成后关机"(见 _shutdown_after_task).
+        """
         # 网络读牌门面: 本场只建一次, 贯穿整场(段位场连打多局共用同一个
         # spool 文件与同一个 GameState). 关闭档不构造(免得白扫目录).
         # 桥不可用时内核停手, 不盲打.
@@ -232,15 +291,17 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         self._attach_engine(cfg, drain=True)
 
         if spec.ranked:
-            self._ranked_games(cfg, spec)
+            completed = self._ranked_games(cfg, spec)
             self._hold_final_result(cfg)
-            return
+            return completed
 
+        completed = False
         for game in range(1, cfg["max_games"] + 1):
             # 连打好几局时这里是长循环, 必须先问停止(见 _should_yield).
             if self._should_yield():
                 self.log_info("收到停止指令, 不再开下一局")
-                return
+                return False
+            self._report_progress(game, cfg["max_games"])
             self.log_info(f"===== 第 {game}/{cfg['max_games']} 局 =====")
             # 上一局的结算页可能没点干净(终局页出现有延迟), 先清掉再等
             # "开始" —— 等待期间也会顺手点掉慢弹出来的页面, 见 _press_start.
@@ -259,7 +320,7 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                 # 别记成 error 让人误以为出了故障.
                 if self.stopped:
                     self.log_info("收到停止指令, 结束连打")
-                    return
+                    return False
                 self.log_error(f"第 {game} 局没能正常结束，停止连打")
                 break
 
@@ -268,27 +329,44 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                 delay = self._rng.uniform(lo, hi)
                 self.log_info(f"局间休息 {delay:.1f}s")
                 self.sleep(delay)
+        else:
+            # 循环一次都没 break/return = 每一局都正常打完.
+            completed = True
 
         self._hold_final_result(cfg)
         self.log_info(f"对局记录: {self._record_path}")
+        return completed
+
+    def _report_progress(self, game: int, total: int) -> None:
+        """把"第几局 / 共几局"写进任务卡上的常驻信息区.
+
+        框架的 TaskCard 会把 `task.info` 渲染成一张表(见 ok 的
+        TaskTab.update_task_info), 运行期间每 0.5s 刷新一次 —— 这就是用户
+        要的"常驻展示"(2026-10-25), 比让他去翻日志稳.
+        """
+        self.info_set("局数", f"第 {game} 局 / 共 {total} 局")
 
     # ---------------------------------------------------------------
     # 段位场循环连打
     # ---------------------------------------------------------------
 
-    def _ranked_games(self, cfg: dict, spec) -> None:
+    def _ranked_games(self, cfg: dict, spec) -> bool:
         """段位场循环: 匹配 -> 打完 -> 回大厅 -> 重新排队 -> 下一局.
 
         与友人场连打的两点不同: ①开下一局不靠准备页的"开始"按钮, 而是
-        回大厅把 段位场->银之间->四人东 整条流程重新点一遍(段位场没有
+        回大厅把 段位场->段位->对局 整条流程重新点一遍(段位场没有
         准备页, 见 rooms.RoomSpec.ranked); ②匹配是分钟级的, 开局前要等
         匹配成功(见 _wait_matchmaking).
+
+        返回是否正常打满局数, 见 _run_games.
         """
+        completed = False
         for game in range(1, cfg["max_games"] + 1):
             # 连打好几局时这里是长循环, 必须先问停止(见 _should_yield).
             if self._should_yield():
                 self.log_info("收到停止指令, 不再开下一局")
-                return
+                return False
+            self._report_progress(game, cfg["max_games"])
             self.log_info(f"===== 第 {game}/{cfg['max_games']} 局（段位场） =====")
             self._wait_matchmaking(cfg, spec, game)
 
@@ -298,7 +376,7 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             if not finished:
                 if self.stopped:
                     self.log_info("收到停止指令, 结束连打")
-                    return
+                    return False
                 self.log_error(f"第 {game} 局没能正常结束，停止连打")
                 break
 
@@ -309,8 +387,11 @@ class PlayOneGameTask(CreateFriendsRoomTask):
                 self.sleep(delay)
                 self._back_to_lobby(cfg, spec, game)
                 self._run_flow(cfg)
+        else:
+            completed = True
 
         self.log_info(f"对局记录: {self._record_path}")
+        return completed
 
     def _wait_matchmaking(self, cfg: dict, spec, game: int) -> None:
         """点完"四人东"后等匹配成功.
@@ -381,30 +462,94 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         self.log_info("  没等到终局页（可能已自动翻页），直接收工")
 
     def _back_to_lobby(self, cfg: dict, spec, game: int) -> None:
-        """终局后等游戏回到大厅(下一轮排队的起点).
+        """终局后一路点到回大厅(下一轮排队的起点).
 
-        期间继续处理慢拍弹出的结算页(见 _drain_result_pages 的说明) --
-        段位场终局页可能带段位分变动弹窗, 不点掉会挡住大厅.
+        段位场终局不是一页, 而是一串: 本局排名 -> 分数变化 -> 获得奖励 ->
+        完成任务(2026-10-22 用户确认的顺序; 奖励页偶发, 不是每局都有).
+        逐个标页面特征太脆 —— 「获得奖励」页上连「终局」标题都只有 0.65,
+        见 REWARD_SCREEN 的说明 —— 而这一串页面的**共同点**是: 点「确认」
+        那个位置就能翻页, 没有按钮的奖励页点同一点也能过(用户实测).
+
+        所以这里不做页面识别: 每轮只问"回到大厅了吗", 没回就在确认位点一下,
+        直到回大厅或等满 LOBBY_RETURN_TIMEOUT 判失败. 页数/顺序都不参与判断,
+        多一页少一页都能过.
+
+        **不设点击次数上限**(2026-10-22 实跑教训): 上一版点到 12 次就只轮询
+        不点了, 那天终局恰好赶上客户端断线重连 —— 12 次点击全被重连遮罩吞掉,
+        第 12 次落在 21s, 客户端 31s 才重连回来, 之后 40s 一次都没再点,
+        于是一路等到超时. 点击被吞是外因, 我们自己的错是"点了 12 次就放弃"。
+        上限只有 LOBBY_RETURN_TIMEOUT 一个.
+
+        代价控制靠`先问大厅再点`: 大厅一旦认出来立刻停手; 认不出来时最多
+        点到超时(那个坐标在大厅上是「寻觅/商家」那排入口), 这是用户拍板的边界.
         """
         deadline = time.time() + tuning.LOBBY_RETURN_TIMEOUT
+        clicks = 0
+        stalled = 0     # 连续几次点击画面一个像素都没动
+        self.log_info(f"第 {game} 局已打完，连点确认位回大厅")
+        frame = self._grab()
         while time.time() < deadline:
             if self._should_yield():
                 raise TaskStopped("等待回大厅期间收到停止指令")
-            frame = self._grab()
-            if self._handle_result_page(frame, cfg, spec, game, 0):
+            if frame is None:
+                # 抓帧失败时 _grab 会退回缓存帧; 连缓存都没有就别算坐标.
+                self.sleep(tuning.PAGE_POLL_INTERVAL)
+                frame = self._grab()
                 continue
-            if self._locate("大厅页", "段位场", cfg, frame,
+            if self._locate(spec.screens.lobby, spec.screens.entry, cfg, frame,
                             strict=True, verbose=False) is not None:
-                self.log_info("    已回到大厅")
+                self.log_info(f"    已回到大厅（终局后点了 {clicks} 次）")
                 return
-            self.sleep(tuning.PAGE_POLL_INTERVAL)
-        self._save_wait_timeout_frame(self._grab(), "大厅页", "段位场")
+            nxt = self._click_result_confirm_spot(frame, game, clicks + 1)
+            if nxt is None:
+                break
+            clicks += 1
+            if page_changed(frame, nxt):
+                stalled = 0
+            else:
+                stalled += 1
+                if stalled == tuning.LOBBY_STALL_CLICKS:
+                    # 只告警不改变行为: 重连回来以后那一下点击仍然要发出去.
+                    self.log_warning(
+                        f"  连点 {clicks} 次画面没有任何变化，点击可能被"
+                        f"断线重连/失焦吞掉了，继续点到 "
+                        f"{tuning.LOBBY_RETURN_TIMEOUT:.0f}s 上限")
+            frame = nxt
+        self._save_wait_timeout_frame(frame, spec.screens.lobby,
+                                      spec.screens.entry)
         raise RuntimeError(
-            f"终局后 {tuning.LOBBY_RETURN_TIMEOUT:.0f}s 没等到大厅页，已中止任务")
+            f"终局后 {tuning.LOBBY_RETURN_TIMEOUT:.0f}s 没等到大厅页"
+            f"（点确认位 {clicks} 次），已中止任务")
 
     def _missing_annotations(self, spec) -> list[str]:
         return missing_categories(required_categories(spec),
                                   set(self._annotations))
+
+    def _warn_optional_annotations(self, spec) -> None:
+        """段位场有几个"缺了不拦、但会让人看不懂报错"的标注.
+
+        「段位不符」只有一处用途: 列表里找不到目标场次时, 告诉我们那是
+        **段位不允许**而不是"模板没认出来". 缺了照样能打, 但报错会变成
+        "滚遍也没找到四人南", 让人以为是标注坏了.
+        """
+        if not spec.ranked:
+            return
+        category = f"{spec.screens.settings}/{RANKED_LOCKED}"
+        if category not in self._annotations:
+            self.log_warning(
+                f"缺标注 '{category}'：段位打不了某一档时会报"
+                f"「找不到场次」而不是「段位不符」（不影响正常打牌）")
+
+    def _missing_result_features(self) -> list[str]:
+        """终局那串页面的特征缺了哪些.
+
+        只告警不中止: 缺一个特征照样能打牌, 只是弹到那一页会点不掉
+        (2026-10-21 就是这么卡死 60s 的). 这类"少一个就不能识别"的东西
+        必须在开局前说出来, 否则表现成打了很多局之后偶发卡住, 极难查.
+        """
+        return missing_categories(
+            [f"{screen}/{feature}" for screen, feature in RESULT_PAGE_FEATURES],
+            set(self._annotations))
 
     def _prune_debug_frames(self) -> None:
         """修剪上一批留下的每轮诊断帧(见 src/retention.py).
@@ -746,16 +891,31 @@ class PlayOneGameTask(CreateFriendsRoomTask):
         """处理终局结算页, 一直点到画面不再是结算页为止.
 
         一局结束可能连着好几页: 点数结算、终局排名、任务完成页, 以及没有
-        确认按钮的「获得奖励」页. 判页用「终局」标题(皮肤挡住时用「确认」
-        按钮兜底); 能匹配到「确认」就点按钮, 匹配不到就在按钮的标注中心
-        点一下 —— 「获得奖励」页没有按钮, 但点任意位置都能翻页.
+        确认按钮的「获得奖励」页. **每页用自己那一页的特征判**(见
+        RESULT_PAGE_FEATURES): 「终局」标题 / 「确认」按钮 / 「获得奖励」.
+        认出奖励页就直接在确认位点一下(它没有按钮, 点任意位置都能翻页);
+        结算页能匹配到「确认」就点按钮.
 
         返回 True 表示这一局已经收尾, 调用方不必再读手牌.
         上限 RESULT_MAX_PAGES 防止页面认错时无限空点.
+
+        终局后回大厅那一路**不用这里**(它是一串页面的连点, 见 _back_to_lobby);
+        这里服务的是"开局前把残留的结算页点干净"(_drain_result_pages)与
+        内核在局内的 result_page 钩子.
         """
         bench.count_state("result_page")  # bench 挂钩(默认关闭)
         pages = 0
         while pages < tuning.RESULT_MAX_PAGES:
+            if self._locate(REWARD_SCREEN, REWARD_FEATURE, cfg, frame,
+                            strict=True, verbose=False) is not None:
+                # 奖励页没有「确认」, 等它只会白等满 RESULT_CONFIRM_TIMEOUT.
+                pages += 1
+                self.log_info(f"第 {game} 局已打完（认出奖励页第 {pages} 页）")
+                nxt = self._click_result_confirm_spot(frame, game, pages)
+                if nxt is None:
+                    break
+                frame = nxt
+                continue
             box = (self._locate(RESULT_SCREEN, RESULT_FEATURE, cfg, frame,
                                 strict=True, verbose=False)
                    or self._locate(RESULT_SCREEN, RESULT_CONFIRM, cfg, frame,
@@ -795,16 +955,17 @@ class PlayOneGameTask(CreateFriendsRoomTask):
             return False
         if pages >= tuning.RESULT_MAX_PAGES:
             self.log_warning(
-                f"连着处理了 {pages} 页结算页还是没离开，"
+                f"连着处理了 {pages} 页(结算/奖励)还是没离开，"
                 f"停止点击（上限 {tuning.RESULT_MAX_PAGES}），交给外层处理")
-        self.log_info(f"第 {game} 局结束（结算页 {pages} 页），共 {turns} 轮")
+        self.log_info(f"第 {game} 局结束（结算/奖励页 {pages} 页），共 {turns} 轮")
         return True
 
     def _click_result_confirm_spot(self, frame, game: int, page: int):
         """在结算页「确认」的标注中心点一下, 返回点击后的新帧.
 
-        只用于没有「确认」按钮的结算页(「获得奖励」等): 页面任意位置都能
-        翻页, 点旧按钮中心最安全 —— 有按钮时那一块就是按钮, 没有时是空白.
+        用在没有「确认」按钮的页(「获得奖励」等)与终局后那串页面的连点
+        (见 _back_to_lobby): 那一块有按钮时点中的就是按钮, 没有按钮时
+        点页面任意位置也能翻页(用户实测), 所以同一个坐标两种页面都成立.
         """
         h, w = frame.shape[:2]
         px = round(tuning.RESULT_CONFIRM_CENTER[0] * w / 1920)

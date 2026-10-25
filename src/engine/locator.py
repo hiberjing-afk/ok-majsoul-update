@@ -26,18 +26,12 @@ def screen_tiles(state: GameState) -> list[str]:
 def slot_index(state: GameState, tile: str) -> int | None:
     """要打的牌 -> 屏幕槽位下标.
 
-    先走 `table.pick_tile_index`(它带"优先打刚摸的那张 / 保留赤 5"的规则),
-    再按归一化牌种兜底: jansou 返回 "5p", 而协议手牌里可能是赤 5 "0p".
+    决策层的牌名是 34 类口径(jansou 给 "5p"), 而协议手牌里赤 5 写作 "0p".
+    两边都归一之后再比 —— 不归一的话 `pick_tile_index` 找不到槽位, "优先
+    打刚摸的那张 / 同种牌里保留赤 5" 的平局裁决也会跟着失效.
     """
-    order = screen_tiles(state)
-    index = pick_tile_index(order, tile, drawn_tile=state.drawn or None)
-    if index is not None:
-        return index
-    target = normalize(tile)
-    for index, held in enumerate(order):
-        if normalize(held) == target:
-            return index
-    return None
+    order = [normalize(held) for held in screen_tiles(state)]
+    return pick_tile_index(order, normalize(tile), drawn_tile=state.drawn or None)
 
 
 def pick_button(groups: dict, kind: str):

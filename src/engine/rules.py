@@ -145,12 +145,17 @@ def _combos(op: dict) -> list[tuple[str, ...]]:
 
 
 def _lizhi_tiles(state: GameState) -> list[str]:
-    """立直时可以打的牌(type=7 的 combination). 没给就返回空."""
+    """立直时可以打的牌(type=7 的 combination). 没给就返回空.
+
+    返回**34 类口径**(赤 5 "0m" 折成 "5m"): 下游拿它跟 jansou 的牌种比较
+    (见 `discard.choose`), 两边写法不统一会把白名单过滤成空.
+    """
     out: list[str] = []
     for op in _ops(state, OP_LIZHI):
         for combo in _combos(op):
-            if combo[0] not in out:
-                out.append(combo[0])
+            kind = normalize(combo[0])
+            if kind not in out:
+                out.append(kind)
     return out
 
 

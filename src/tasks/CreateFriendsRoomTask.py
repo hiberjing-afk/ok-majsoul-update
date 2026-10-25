@@ -99,6 +99,7 @@ from src.rooms import (
     LENGTH_OPTIONS,
     LOGIN_ENTRY,
     PLAYER_OPTIONS,
+    RANKED_LOCKED,
     RoomSpec,
     Step,
     build_room_flow,
@@ -108,7 +109,7 @@ from src.rooms import (
     spec_by_key,
 )
 from src.tasks import tuning
-from src.vision import is_selected_orange
+from src.vision import is_selected_orange, page_changed
 from src.widget_types import mark_unrenderable_hidden
 from src.window import clamp_into_screen
 
@@ -475,6 +476,10 @@ class CreateFriendsRoomTask(BaseTask):
             self.log_info(label)
             if step.toggle:
                 self._click_toggle(step.screen, step.target, cfg)
+            elif step.scroll:
+                # 列表里的卡片会随滚动换位置, 首屏还可能不在(三人南就在屏幕外),
+                # 所以走"找 -> 滚 -> 找", 不用固定坐标.
+                self._click_list_item(step.screen, step.target, cfg)
             else:
                 self._click_button(step.screen, step.target, cfg)
 
@@ -709,6 +714,71 @@ class CreateFriendsRoomTask(BaseTask):
             )
         self._click_box(box, screen, keyword, cfg)
 
+    def _click_list_item(self, screen: str, keyword: str, cfg: dict) -> None:
+        """可滚动列表里点一项: 找 -> 滚一格 -> 再找, 直到滚到底.
+
+        为什么不能用位置匹配(2026-10-25 用户提出要打三人南): 段位/对局列表
+        一屏只露三张卡片, **三人南在最下面根本不在画面里** —— 标注坐标只
+        对应"截图那一刻它在哪里", 对滚动后的画面毫无意义. 所以只能像人一样
+        滑动着找.
+
+        判定顺序也是一条设计: 先找目标, 找遍了才看「段位不符」. 反过来会把
+        "目标只是还没滚到"误报成"你段位不够".
+        """
+        locked = False
+        for step in range(tuning.LIST_SCROLL_MAX_STEPS + 1):
+            if self._should_yield():
+                raise TaskStopped(f"在列表里找 '{keyword}' 时收到停止指令")
+            frame = self._grab()
+            if frame is None:
+                self.sleep(tuning.PAGE_POLL_INTERVAL)
+                continue
+            search = self.list_search_box(frame)
+            found = self._locate(screen, keyword, cfg, frame, strict=True,
+                                 strict_threshold=tuning.LIST_ITEM_THRESHOLD,
+                                 verbose=False, search_box=search)
+            if found is not None:
+                self.log_info(f"    列表第 {step + 1} 屏找到 '{keyword}'")
+                self._click_box(found, screen, keyword, cfg)
+                return
+            if not locked and self._locate(screen, RANKED_LOCKED, cfg, frame,
+                                           strict=True, verbose=False,
+                                           search_box=search) is not None:
+                locked = True
+            if step == tuning.LIST_SCROLL_MAX_STEPS:
+                break
+            if not self._scroll_list(frame, cfg):
+                self.log_info("    列表已滚到底，不再滚动")
+                break
+
+        if locked:
+            raise RuntimeError(
+                f"'{screen}/{keyword}' 这一档在游戏里显示「{RANKED_LOCKED}」，"
+                f"当前段位打不了这一档（段位过高或过低都会这样）。"
+                f"换一个段位或对局再跑，不要去改标注。")
+        self._diagnose_missing(screen, keyword, cfg)
+        raise RuntimeError(
+            f"在 '{screen}' 的列表里滚遍也没找到 '{keyword}'（可能这一档没开放）")
+
+    def _scroll_list(self, frame, cfg: dict) -> bool:
+        """在列表列里向下滚一格, 返回画面是否变了(没变 = 已经到底)."""
+        interaction = getattr(self.executor, "interaction", None)
+        if interaction is None:
+            return False
+        frame_h, frame_w = frame.shape[:2]
+        x = round(tuning.LIST_SCROLL_POINT[0] * frame_w)
+        y = round(tuning.LIST_SCROLL_POINT[1] * frame_h)
+        self._ensure_foreground()
+        try:
+            # 滚轮落在列表列内部: 雀魂的列表只认鼠标所在区域的滚轮.
+            interaction.scroll(x, y, tuning.LIST_SCROLL_AMOUNT)
+        except Exception as e:  # noqa: BLE001 - 滚不动就当到底, 交给上层报错
+            self.log_warning(f"    滚动失败: {e}")
+            return False
+        self.log_info("    列表向下滚动，继续找")
+        self.sleep(tuning.LIST_SCROLL_SETTLE)
+        return page_changed(frame, self._grab())
+
     def _diagnose_missing(self, screen: str, keyword: str, cfg: dict) -> None:
         """等不到按钮时, 把"到底差多少"说清楚, 并留一张待标注截图.
 
@@ -893,6 +963,7 @@ class CreateFriendsRoomTask(BaseTask):
         strict: bool = False,
         verbose: bool = True,
         strict_threshold: float | None = None,
+        search_box: tuple[int, int, int, int] | None = None,
     ) -> Optional[Box]:
         """在当前帧里定位标注区域描述对应的按钮.
 
@@ -914,7 +985,11 @@ class CreateFriendsRoomTask(BaseTask):
         if category not in self._annotations:
             self.log_debug(f"    没有 '{category}' 这个标注")
             return None
-        box = self._search_box_for(screen_path, keyword, cfg, frame)
+        if search_box is not None:
+            # 调用方给了搜索区(可滚动列表用它: 标注坐标在那里没有意义).
+            box = Box(*search_box, name=f"search_{keyword}")
+        else:
+            box = self._search_box_for(screen_path, keyword, cfg, frame)
         if box is None:
             return None
 
@@ -957,6 +1032,19 @@ class CreateFriendsRoomTask(BaseTask):
             self.log_debug(f"    搜索区为空 '{screen_path}/{keyword}'")
             return None
         return Box(x, y, w, h, name=f"search_{keyword}")
+
+    @staticmethod
+    def list_search_box(frame) -> tuple[int, int, int, int]:
+        """可滚动列表那一列的搜索区(帧像素).
+
+        与 `_search_box_for` 的区别: 那个是"标注框 ±50%", 只够容忍几个像素的
+        抖动; 列表项会随滚动整列上下移动, 必须在**整列**里滑窗找. 比例定义在
+        `tuning.LIST_SEARCH_BOX`, 换分辨率自动跟着换算.
+        """
+        frame_h, frame_w = frame.shape[:2]
+        rx, ry, rw, rh = tuning.LIST_SEARCH_BOX
+        return (int(rx * frame_w), int(ry * frame_h),
+                max(1, int(rw * frame_w)), max(1, int(rh * frame_h)))
     # ---------------------------------------------------------------
     # 截图
     # ---------------------------------------------------------------

@@ -12,7 +12,8 @@ from pathlib import Path
 # 页签里截图 / 画框直接写 coco_annotations.json, 任务端 find_one 直接读它,
 # 中间不需要任何"导出 / 转换"环节(历史教训见 docs/ARCHITECTURE.md)。
 #
-# 目录内容(截图 + COCO)都不进版本库: 截图是"只替换不修改"的素材, 留历史没意义。
+# 目录内容(截图 + COCO)进版本库(2026-10-25 起): 它是运行期唯一真源, 必须能被
+# 下一版自动带上, 否则改一条标注就得手工重传一次资源包。改标注 = 普通提交。
 TEMPLATES_DIR = Path("ok_templates")
 COCO_ANNOTATIONS = TEMPLATES_DIR / "coco_annotations.json"
 

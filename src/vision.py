@@ -120,6 +120,31 @@ def is_toggle_green(frame: np.ndarray, box: Box, threshold: float = 0.02) -> boo
     return green_ratio(frame, box) >= threshold
 
 
+def page_changed(before: np.ndarray | None, after: np.ndarray | None,
+                 threshold: float = 1.0) -> bool:
+    """两张整帧画面是不是**翻了页**(缩到 64x36 灰度后比平均绝对差).
+
+    只用于"点了一下之后页面动没动"这种**整页级**变化(翻页 = 大片像素同时
+    换掉, 差值是几十这个量级), 阈值 1.0 只挡掉编码噪声. 拿不到可比的两帧
+    (None / 尺寸不同)一律算"变了" —— 判不出来时不许声称"画面没动".
+
+    **不能拿它判"对局里静止"**: 一张手牌只占整帧千分之几, 差 0.0004,
+    和什么都没有完全区分不开(见下面卡死检测那段说明).
+    """
+    if before is None or after is None:
+        return True
+    before = np.asarray(before)
+    after = np.asarray(after)
+    if before.ndim != 3 or before.shape != after.shape:
+        return True
+    size = (64, 36)
+    a = cv2.resize(cv2.cvtColor(before, cv2.COLOR_BGR2GRAY), size,
+                   interpolation=cv2.INTER_AREA)
+    b = cv2.resize(cv2.cvtColor(after, cv2.COLOR_BGR2GRAY), size,
+                   interpolation=cv2.INTER_AREA)
+    return float(np.mean(cv2.absdiff(a, b))) > threshold
+
+
 # ---- 卡死检测(纯逻辑, 不碰像素) ----
 #
 # 用途: 对局结束后会进结算页, 画面一动不动, 而牌河被牌面模型误识成"手牌"

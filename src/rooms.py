@@ -30,6 +30,30 @@ from typing import Optional
 PLAYER_OPTIONS: tuple[str, ...] = ("三人", "四人")
 LENGTH_OPTIONS: tuple[str, ...] = ("一局", "东风局")
 
+# ---- 段位场的两段选择(2026-10-25 用户要求细化)----
+#
+# 流程是「大厅 -> 段位场 -> 段位(tier) -> 对局(game) -> 自动匹配」:
+#   tier  段位场选择段位页上的卡片: 铜之间/银之间/金之间/玉之间...
+#   game  选中段位后那一页(段位场选择对局页)上的卡片: 四人东/四人南/三人东/三人南
+# 两页都是**可滚动列表**: 靠下的卡片可能只露半个(三人南在 1080p 上就在屏幕外),
+# 所以点它们不能位置匹配, 要"找 -> 滚 -> 再找"(见 Step.scroll).
+RANKED_TIER_OPTIONS: tuple[str, ...] = ("银之间", "金之间")
+RANKED_GAME_OPTIONS: tuple[str, ...] = ("四人东", "四人南", "三人东", "三人南")
+
+#: 段位场两张列表页的页名(标注里的 "页名/" 前缀, 必须逐字一致).
+RANKED_TIER_SCREEN = "段位场选择段位页"
+RANKED_GAME_SCREEN = "段位场选择对局页"
+
+#: 段位/对局卡片上"这一档不开放"时的标题文字(红字).
+#: 出现它就说明**当前账号的段位打不了这一档**(例子: 三人场段位过高, 银之间的
+#: 三人场那格就显示「段位不符」), 不是找不到按钮.
+RANKED_LOCKED = "段位不符"
+
+#: 中文选项 -> 规格 key 里的英文段, 只影响配置文件的写法, 不影响界面.
+_TIER_KEYS = {"银之间": "silver", "金之间": "gold"}
+_GAME_KEYS = {"四人东": "4p_east", "四人南": "4p_south",
+              "三人东": "3p_east", "三人南": "3p_south"}
+
 
 @dataclass(frozen=True)
 class Step:
@@ -39,12 +63,16 @@ class Step:
     target:  要点击的区域描述(类目名的后半, 如 "友人场")
     detect:  可选. 先用这个区域探测当前页面, 命中才执行本步; 不命中则跳过.
     toggle:  这一步是"开关型按钮"(选中/未选中外观不同), 用颜色判断而非模板匹配.
+    scroll:  目标在**可滚动列表**里, 首屏可能看不到(三人南就在屏幕外).
+             这类步骤走"找 -> 滚一格 -> 再找", 不能用固定位置匹配;
+             搜索区也要放大到整列(见 tuning.LIST_SEARCH_BOX).
     """
 
     screen: str
     target: str
     detect: Optional[str] = None
     toggle: bool = False
+    scroll: bool = False
 
 
 # 登录后的入口判定: 命中哪个就在哪个页面, 都命中不了说明还没进入游戏界面.
@@ -155,37 +183,63 @@ FRIENDS_4P_EAST = RoomSpec(
     ),
 )
 
-# 段位场(银之间 四人东): 2026-10-09 用户标注齐了(银之间重标在新截图上,
-# 四人东是"段位场选择对局页"上的直接入口按钮), 流程见 RoomSpec.ranked 说明.
-# 页名约定: 点银之间之后的页面列出 四人东/四人南/三人东/三人南,
-# 命名为"段位场选择对局页"; 点四人东后自动匹配, 匹配成功的标志是
-# "对局开始页"的胜负横幅(无准备页、无"开始"按钮).
-RANKED_SILVER_4P = RoomSpec(
-    key="ranked_silver_4p",
-    label="段位场 银之间 四人东",
-    player_count=4,
-    ranked=True,
-    screens=RoomScreens(
-        entry="段位场",
-        room_list="段位场选择段位页",
-        create="银之间",
-        settings="段位场选择对局页",
-        player_count="四人东",     # 这页上不是开关, 是直接点就匹配的入口
-        length="",                 # 段位场没有时长选择
-        confirm="",                # 也没有确认按钮
-        ready="对局开始页",         # 匹配成功 -> 胜负横幅(当 ready_marker 用)
-        ready_marker="胜负",
-        start="",                  # 匹配成功自动开局, 没有"开始"可点
-        bots=(),                   # 段位场是真人对局, 不用加电脑
-    ),
+# 段位场: 段位(tier) x 对局(game) 两张表相乘, 8 个规格.
+#
+# 页名约定(2026-10-09 标注、2026-10-25 补齐金之间与另外三个对局):
+#   点「段位场」-> 段位场选择段位页(铜/银/金/玉之间)
+#   点「银之间」-> 段位场选择对局页(四人东/四人南/三人东/三人南)
+#   点「四人东」-> 自动匹配开局(无准备页、无"开始"按钮)
+#
+# 两张列表页都可能要滚动: 段位页最下面的玉之间、对局页最下面的三人南在
+# 1080p 上都看不全, 所以这两步都带 scroll=True.
+def _ranked_spec(tier: str, game: str) -> RoomSpec:
+    """拼一个段位场规格. key 形如 ranked_silver_4p_east."""
+    if tier not in RANKED_TIER_OPTIONS:
+        raise KeyError(f"没有段位 '{tier}'（可选: {list(RANKED_TIER_OPTIONS)}）")
+    if game not in RANKED_GAME_OPTIONS:
+        raise KeyError(f"没有对局 '{game}'（可选: {list(RANKED_GAME_OPTIONS)}）")
+    return RoomSpec(
+        key=f"ranked_{_TIER_KEYS[tier]}_{_GAME_KEYS[game]}",
+        label=f"段位场 {tier} {game}",
+        # 三人麻将去掉 2m-8m, 牌桌标注也分三人/四人两套, 所以人数必须从
+        # 对局名推出来, 不能写死.
+        player_count=4 if game.startswith("四人") else 3,
+        ranked=True,
+        screens=RoomScreens(
+            entry="段位场",
+            room_list=RANKED_TIER_SCREEN,
+            create=tier,
+            settings=RANKED_GAME_SCREEN,
+            player_count=game,      # 这页上不是开关, 是直接点就匹配的入口
+            length="",              # 段位场没有时长选择
+            confirm="",             # 也没有确认按钮
+            ready="对局开始页",      # 匹配成功 -> 胜负横幅(当 ready_marker 用)
+            ready_marker="胜负",
+            start="",               # 匹配成功自动开局, 没有"开始"可点
+            bots=(),                # 段位场是真人对局, 不用加电脑
+        ),
+    )
+
+
+RANKED_SPECS: tuple[RoomSpec, ...] = tuple(
+    _ranked_spec(tier, game)
+    for tier in RANKED_TIER_OPTIONS
+    for game in RANKED_GAME_OPTIONS
 )
 
+#: 老配置里的 key(只有一个「银之间四人东」)。保留它是因为 configs/*.json 里
+#: 可能写着 room="ranked_silver_4p"; 新 key 从它派生, 指向同一个规格.
+LEGACY_RANKED_KEYS: dict[str, str] = {"ranked_silver_4p": "ranked_silver_4p_east"}
+
 ROOM_SPECS: tuple[RoomSpec, ...] = (FRIENDS_3P_EAST, FRIENDS_4P_EAST,
-                                    RANKED_SILVER_4P)
+                                    *RANKED_SPECS)
 
 # 标注已经齐, 可以真正跑起来的规格.
 # 没列进来的规格在测试里只断言"缺标注被报出来", 不会因为没标注而失败.
-READY_SPECS: tuple[str, ...] = ("friends_3p", "friends_4p", "ranked_silver_4p")
+READY_SPECS: tuple[str, ...] = (
+    "friends_3p", "friends_4p",
+    *(spec.key for spec in RANKED_SPECS),
+)
 
 # ---- 界面下拉框 -> 房间规格 ----
 #
@@ -249,11 +303,20 @@ def spec_by_combination(players: str, length: str) -> RoomSpec:
 
 def spec_by_key(key: str) -> RoomSpec:
     """按 key 取规格; 找不到就抛(配置写错要立刻发现, 不要静默回退)."""
+    key = LEGACY_RANKED_KEYS.get(key, key)
     for spec in ROOM_SPECS:
         if spec.key == key:
             return spec
     available = ", ".join(spec.key for spec in ROOM_SPECS)
     raise KeyError(f"没有 key 为 '{key}' 的房间规格（已有: {available}）")
+
+
+def ranked_spec(tier: str, game: str) -> RoomSpec:
+    """按界面上的两个选项取段位场规格.
+
+    非法组合**立刻报错**: 开出一个错的局(比如想打三人南却点了四人东)比崩掉更糟.
+    """
+    return _ranked_spec(tier, game)
 
 
 def build_room_flow(spec: RoomSpec) -> list[Step]:
@@ -273,8 +336,9 @@ def build_room_flow(spec: RoomSpec) -> list[Step]:
         return [
             Step("活动页", "返回大厅", detect="活动标题"),
             Step(screens.lobby, screens.entry),
-            Step(screens.room_list, screens.create),
-            Step(screens.settings, screens.player_count),
+            # 段位页与对局页都是可滚动列表: 目标可能在屏幕外, 走"找->滚->找".
+            Step(screens.room_list, screens.create, scroll=True),
+            Step(screens.settings, screens.player_count, scroll=True),
         ]
     flow = [
         Step("活动页", "返回大厅", detect="活动标题"),

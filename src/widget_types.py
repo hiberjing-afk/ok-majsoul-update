@@ -6,7 +6,7 @@
 所以这里只放纯逻辑, 不 import 框架任何东西.
 
 **规则本身**(2026-10-07 逐行核对
-`.venv/Lib/site-packages/ok/ui/qt/tasks/ConfigItemFactory.py:52-71`):
+`.runtime/site-packages/ok/ui/qt/tasks/ConfigItemFactory.py:52-71`):
 
     if   isinstance(value, bool):  SwitchButton
     elif isinstance(value, list):  ModifyListItem

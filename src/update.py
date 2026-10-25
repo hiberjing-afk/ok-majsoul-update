@@ -213,7 +213,11 @@ def self_update(release: ReleaseInfo, install_dir: Path | None = None) -> bool:
 #
 # 启动器只同步代码（tools/sync_update_repo.py 白名单），装好的 working 目录
 # 里没有 ok_templates/ 与 models/。这里在启动时检测缺失并从主仓库 Release
-# 的主程序包里**只**解压这两样（约 120MB，含隐私截图，永不进任何仓库）。
+# 的主程序包里**只**解压这两样（约 120MB）。
+#
+# ok_templates/ **在主仓库里是入库的**（2026-10-25 起，理由见 .gitignore）；
+# 它仍然进这个白名单，是因为 update 仓库是公开的、模板不随代码同步过去，
+# 启动器装完确实没有它。所以别因为"git 里有"就把这条删掉。
 # ---------------------------------------------------------------------------
 
 #: 资源在包内的顶层目录

@@ -32,7 +32,7 @@ from jansou.analysis.waits import waits
 from jansou.core.hand import Hand
 from jansou.core.notation import parse_mpsz
 
-from src.mahjong.tiles import kind_name_to_tile, to_mpsz
+from src.mahjong.tiles import kind_name_to_tile, parse_tile, to_mpsz
 
 # 打出的牌是怎么选出来的. 记进日志, 出问题时能回溯.
 PICK_BEST = "best"
@@ -185,6 +185,22 @@ def _extension_ukeire(tiles13: list[str], meld_count: int,
 MAX_EXTENSION_CANDIDATES = 4
 
 
+def _kind_index(tiles: list[str], kind: str) -> int | None:
+    """手牌里"牌种为 kind"的那一张的下标; 容忍赤 5 的两种写法.
+
+    `kind` 是 jansou 的 34 类记号("5m"), 而协议手牌里赤 5 写作 "0m".
+    找不到就返回 None —— 调用方据此跳过这条平局裁决. **这里不能抛**:
+    牌效是"EV 算不出来"时的兜底路径, 抛一次就把整场对局打成"决策异常停手".
+    """
+    for index, held in enumerate(tiles):
+        try:
+            if parse_tile(held) == kind:
+                return index
+        except ValueError:
+            continue
+    return None
+
+
 def _extension_tiebreak(options, tiles: list[str], meld_count: int,
                         player_count: int, keep_kinds: frozenset[str] = frozenset()):
     """一阶(向听, 进张)完全平分的候选里, 按二阶进张(发展潜力)重排.
@@ -215,7 +231,10 @@ def _extension_tiebreak(options, tiles: list[str], meld_count: int,
         if tile in future:
             continue
         rest = list(tiles)
-        rest.remove(tile)                    # 同种牌多张时移哪张都一样
+        index = _kind_index(rest, tile)
+        if index is None:
+            continue          # 手牌里没这张(异常数据): 不做二阶裁决, 排序时垫底
+        rest.pop(index)       # 同种牌多张时移哪张都一样
         future[tile] = _extension_ukeire(rest, meld_count, player_count)
     tied_ids = {id(o) for o in tied}
     untied = [o for o in options if id(o) not in tied_ids]
@@ -224,8 +243,9 @@ def _extension_tiebreak(options, tiles: list[str], meld_count: int,
         k = kind_name_to_tile(o.discard.name)
         return int(k in keep_kinds and tiles.count(k) >= 2)
 
+    # 拿不到二阶进张的(见上面的 continue)按 -1 计入, 排序时排最后.
     return sorted(tied, key=lambda o: (breaks_yaku(o),
-                                       -future[kind_name_to_tile(o.discard.name)])) \
+                                       -future.get(kind_name_to_tile(o.discard.name), -1))) \
         + untied
 
 

@@ -28,13 +28,13 @@
 from __future__ import annotations
 
 import os
-import shutil
 import socket
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from src import runtime_paths
 
 ROOT = Path(__file__).resolve().parents[2]
 MITM_DIR = ROOT / "tools" / "mitm"
@@ -45,15 +45,9 @@ LOG_PATH = ROOT / "logs" / "mitm_capture.log"
 #: Windows: 子进程不弹控制台窗口(否则任务跑起来会蹦出黑框).
 CREATE_NO_WINDOW = 0x08000000
 
-#: mihomo 可执行文件的候选位置(前两个是本机实测在用的; 其余是常见安装位置).
-#: 顺序 = 优先级, 环境变量 OKMAJSOUL_MIHOMO / tuning.CAPTURE_MIHOMO 更优先.
-_MIHOMO_CANDIDATES = (
-    r"D:\basic\vpn\verge-mihomo.exe",
-    r"D:\basic\vpn\verge-mihomo-alpha.exe",
-    r"C:\Program Files\Clash Verge\verge-mihomo.exe",
-    r"C:\Program Files\Clash Verge\verge-mihomo-alpha.exe",
-    r"C:\Program Files (x86)\Clash Verge\verge-mihomo.exe",
-)
+# 运行时资产的路径与查找全部来自 runtime_paths(bootstrap 装、这里用).
+find_mihomo = runtime_paths.find_mihomo
+ca_cert_path = runtime_paths.ca_cert_path
 
 
 def is_admin() -> bool:
@@ -94,44 +88,6 @@ def tun_device_present(name: str = "mihomo-tun") -> bool:
     except Exception:  # noqa: BLE001
         return False
     return name.encode("ascii", "ignore").lower() in out.lower()
-
-
-def find_mitmdump() -> str | None:
-    """mitmdump 可执行文件.
-
-    三个布局都要认:
-      `.runtime`   -> `<项目>/.runtime/bin/mitmdump.cmd`   (bootstrap 生成的替身)
-      `.venv`      -> `<prefix>/Scripts/mitmdump.exe`      (标准 venv)
-      系统         -> PATH 上的 mitmdump
-
-    **为什么 `.runtime` 不用 pip --target 生成的 bin/mitmdump.exe**:
-    那个 exe 把安装时那个解释器的绝对路径写死在启动器里, `.runtime` 拷到别的
-    机器上就指向不存在的 python. 替身脚本按相对路径调 `python -m`, 才可搬运.
-    """
-    candidates = [
-        Path(__file__).resolve().parents[2] / ".runtime" / "bin" / "mitmdump.cmd",
-        Path(sys.prefix) / "Scripts" / "mitmdump.exe",
-    ]
-    for exe in candidates:
-        if exe.is_file():
-            return str(exe)
-    return shutil.which("mitmdump")
-
-
-def find_mihomo(explicit: str = "") -> str | None:
-    """mihomo 可执行文件. 优先级: 显式指定 > 环境变量 > 常见安装位置 > PATH."""
-    for cand in (explicit, os.environ.get("OKMAJSOUL_MIHOMO", "")):
-        if cand and Path(cand).is_file():
-            return cand
-    for cand in _MIHOMO_CANDIDATES:
-        if Path(cand).is_file():
-            return cand
-    return shutil.which("verge-mihomo") or shutil.which("mihomo")
-
-
-def ca_cert_path() -> Path:
-    """mitmproxy 自己生成的 CA 证书(首次跑 mitmdump 时自动生成)."""
-    return Path(os.path.expanduser("~")) / ".mitmproxy" / "mitmproxy-ca-cert.cer"
 
 
 def ca_trusted(cert: Path | None = None) -> bool:
@@ -182,10 +138,15 @@ def install_ca(cert: Path | None = None) -> bool:
     return done.returncode == 0
 
 
-def mitm_cmd(mitmdump: str, port: int, addon: Path = ADDON,
-             upstream: str = "") -> list[str]:
-    """mitmdump 命令行. 抽成纯函数以便单测锁死参数顺序.与 run_mitm.py 一致."""
-    cmd = [mitmdump, "-p", str(port), "--mode", "regular", "-s", str(addon)]
+def mitm_cmd(prefix: list[str], port: int, addon: Path = ADDON,
+             upstream: str = "", confdir: Path = runtime_paths.MITM_CONF) -> list[str]:
+    """mitmdump 命令行(纯函数, 便于单测锁死参数顺序).
+
+    `prefix` 是 runtime_paths.mitmdump_cmd() 给的启动前缀(解释器 + 入口函数).
+    `confdir` 指进项目内: CA 与配置跟着目录走, 换机器不用重新签发证书.
+    """
+    cmd = [*prefix, "--set", f"confdir={confdir}", "-p", str(port),
+           "--mode", "regular", "-s", str(addon)]
     if upstream:
         cmd += ["--mode", f"upstream:{upstream}"]
     return cmd
@@ -278,9 +239,9 @@ class CaptureSupervisor:
             status.ok = True
             status.notes.append(f":{self.port} 已在监听, 复用(退出时不动)")
             return
-        mitmdump = self.mitm_bin or find_mitmdump()
-        if not mitmdump:
-            status.errors.append("没找到 mitmdump —— .venv 里执行 pip install mitmproxy")
+        prefix = [self.mitm_bin] if self.mitm_bin else runtime_paths.mitmdump_cmd()
+        if not prefix:
+            status.errors.append("运行时里没有 mitmproxy —— 先跑 setup.bat")
             return
         if self.spool is None:
             from src.net.bridge import spool_path_for
@@ -289,7 +250,8 @@ class CaptureSupervisor:
         env = dict(os.environ)
         env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         env["LIQI_SPOOL"] = str(self.spool)
-        cmd = mitm_cmd(mitmdump, self.port, upstream=self.upstream)
+        runtime_paths.MITM_CONF.mkdir(parents=True, exist_ok=True)
+        cmd = mitm_cmd(prefix, self.port, upstream=self.upstream)
         self._mitm_proc = self._spawn(cmd, env=env)
         if self._mitm_proc is None:
             status.errors.append("mitmdump 启动失败(见 logs/mitm_capture.log)")
@@ -309,7 +271,9 @@ class CaptureSupervisor:
             return
         mihomo = self.mihomo_bin or find_mihomo()
         if not mihomo:
-            status.errors.append("没找到 mihomo(verge-mihomo.exe), 流量导不进来")
+            status.errors.append(
+                "没找到 mihomo, 流量导不进来. 修法: 双击 setup.bat(会放一份到 "
+                ".runtime\\bin\\mihomo.exe), 或用 OKMAJSOUL_MIHOMO 指定路径")
             return
         if not self._admin_probe():
             status.errors.append("非管理员权限, 建不了 TUN 网卡(请用 run_admin.bat 启动)")
@@ -323,8 +287,8 @@ class CaptureSupervisor:
             else:
                 status.errors.append(
                     "mitmproxy CA 没装进受信任根, 已跳过 TUN(否则游戏 HTTPS 会"
-                    "连不上). 修法: 双击 %USERPROFILE%\\.mitmproxy\\"
-                    "mitmproxy-ca-cert.cer -> 装到「受信任的根证书颁发机构」")
+                    "连不上). 修法: setup.bat --ca, 或双击 "
+                    f"{ca_cert_path()} -> 装到「受信任的根证书颁发机构」")
                 return
         self._tun_proc = self._spawn(tun_cmd(mihomo), env=None)
         if self._tun_proc is None:

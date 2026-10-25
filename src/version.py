@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.3.0"
 
 # GitHub 仓库（owner/repo）。空字符串 = 未发布状态，跳过更新检查。
 UPDATE_REPO = "hiberjing-afk/ok-majsoul"

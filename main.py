@@ -30,26 +30,31 @@ from pathlib import Path
 # 与 tools/check_gui_startup.py:39 同一处理(2026-10-11 v1.2.0 实测踩坑).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# 允许覆盖的键(取自 PlayOneGameTask._default_config).
+# 允许覆盖的键(取自两个任务卡各自的 _default_config).
 # 故意显式列出: 拼错键名要立刻警告, 而不是静默写进去以为生效了.
 #
-# 房型现在是界面上两个下拉框: players(三人/四人) + length(一局/东风局),
-# 组合由 src/rooms.py 的组合表解析; room 是**派生字段**, 一般不用手填,
-# 但保留在白名单里以便临时强制指定(留空 = 由 players+length 推导).
+# 段位场与友人场 2026-10-25 拆成两张卡: 段位场选 段位(tier) + 场次(game),
+# 友人场选 人数(players) + 时长(length). room 是**派生字段**, 一般不用手填,
+# 但保留在白名单里以便临时强制指定(留空 = 由上面两项推导).
 ALLOWED_KEYS = {
-    # 只列**用户真正常用的**配置项(2026-10-07 用户决定), 与
-    # src/tasks/PlayOneGameTask.py 的 _DEFAULT_CONFIG 一一对应.
+    # 只列**用户真正常用的**配置项(2026-10-07 用户决定), 与各任务模块的
+    # _DEFAULT_CONFIG 一一对应.
     # 其余二十多项阈值/延迟/比例已经搬去 src/tasks/tuning.py 做模块常量,
     # 它们不再是配置项, 所以这里也不接受 --set: 给了也无处可去,
     # 静默写进 configs/*.json 只会造成"改了却没生效"的错觉.
     # 要调那些参数请直接改 tuning.py 里的常量.
-    "PlayOneGameTask": {
-        "players", "length", "room",       # 房型(前两个是界面下拉框)
-        "max_games", "save_frames", "robust_discard",
+    "PlayRankedTask": {
+        "tier", "game", "room",             # 段位 + 场次(前两个是界面下拉框)
+        "max_games", "shutdown_after",
+    },
+    "PlayFriendsTask": {
+        "players", "length", "room",         # 房型(前两个是界面下拉框)
+        "max_games", "shutdown_after",
     },
 }
 
-TARGET_TASK = "PlayOneGameTask"
+#: `--set` 改的是这个任务卡的配置文件(段位场是主任务).
+TARGET_TASK = "PlayRankedTask"
 
 
 def _parse_value(text: str):

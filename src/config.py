@@ -107,9 +107,14 @@ config = {
     "my_app": ["src.globals", "Globals"],
     # 项目自带任务(用户点击触发)
     # "创建友人场房间"卡片已下架(2026-10-08 用户拍板: 只用打牌任务, 单独开房
-    # 没用了). **类不能删** —— PlayOneGameTask 继承它复用整套开房/匹配/点击
-    # 流程, 这里只是不再把它注册成独立任务卡片.
+    # 没用了). **类不能删** —— PlayFriendsTask / PlayRankedTask 继承它复用
+    # 整套开房/匹配/点击流程, 这里只是不再把它注册成独立任务卡片.
+    #
+    # 段位场与友人场已拆成两张卡片(2026-10-25 用户要求): 段位场要选
+    # 段位 x 场次, 友人场要选人数 x 时长, 两套选项不相干, 挤在一个下拉框里
+    # 只会互相干扰. PlayOneGameTask 退成两者的公共基类, 不再注册.
     "onetime_tasks": [
-        ["src.tasks.PlayOneGameTask", "PlayOneGameTask"],
+        ["src.tasks.PlayRankedTask", "PlayRankedTask"],
+        ["src.tasks.PlayFriendsTask", "PlayFriendsTask"],
     ],
 }
